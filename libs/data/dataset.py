@@ -5,7 +5,7 @@ import json
 import math
 import os
 import random
-
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -56,7 +56,18 @@ class BaseDataset(Dataset):
         num_epochs=1,           # number of epochs
     ):
         super(BaseDataset, self).__init__()
-
+        print(anno_file)
+        p = Path(anno_file)
+        print("raw:", repr(anno_file))
+        print("cwd:", os.getcwd())
+        print("abspath:", os.path.abspath(anno_file))
+        print("resolve:", str(p.resolve()))
+        print("exists:", p.exists())
+        print("lexists:", os.path.lexists(anno_file))
+        print("isfile:", p.is_file())
+        print("isdir:", p.is_dir())
+        print("parent exists:", p.parent.exists())
+        print("parent access X:", os.access(str(p.parent), os.X_OK))
         assert os.path.exists(anno_file)
         if not isinstance(split, (list, tuple)):
             split = (split, )

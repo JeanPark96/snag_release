@@ -34,7 +34,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--opt', type=str, help="training options")
     parser.add_argument('--name', type=str, help="job name")
+    parser.add_argument('--seed', type=int, default=1234567891, help="overwrite seed")
     args = parser.parse_args()
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.enabled = False
 
     # create experiment folder
     os.makedirs('experiments', exist_ok=True)
@@ -48,15 +52,18 @@ if __name__ == '__main__':
         shutil.copyfile(opt_path, os.path.join(root, 'opt.yaml'))
         os.makedirs(os.path.join(root, 'models'), exist_ok=True)
         os.makedirs(os.path.join(root, 'states'), exist_ok=True)
+    print("original seed", opt["seed"], " overwrite with ", args.seed)
+    opt["seed"] = args.seed
     opt['_root'] = root
     opt['_resume'] = (
         os.path.exists(os.path.join(root, 'models', 'last.pth'))
         and os.path.exists(os.path.join(root, 'states', 'last.pth'))
     )
-
+    #n_gpus = 1
+    n_gpus = torch.cuda.device_count()
     # set up distributed training
     ## NOTE: only supports single-node training
-    opt['_world_size'] = n_gpus = torch.cuda.device_count()
+    opt['_world_size'] = n_gpus
     opt['_distributed'] = n_gpus > 1
     if opt['_distributed']:
         mp.spawn(main, nprocs=n_gpus, args=(opt, ))

@@ -27,3 +27,6 @@ if __name__ == '__main__':
     
     evaluator = Evaluator(opt)
     evaluator.run()
+    # evaluator.run_failure_analysis()
+    # evaluator.run_confidence_analysis()
+    #evaluator.run_token_attention_analysis()

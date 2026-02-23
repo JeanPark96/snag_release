@@ -1,11 +1,12 @@
 from copy import deepcopy
 import math
 
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .blocks import (
-    sinusoid_encoding, MaskedConv1D, LayerNorm, TransformerEncoder
+    sinusoid_encoding, MaskedConv1D, LayerNorm, TransformerEncoder, LoopedTransformerBlock
 )
 
 
@@ -157,6 +158,194 @@ class VideoTransformer(nn.Module):
 
         return fpn, fpn_masks
 
+@register_video_net('transformer_looped')
+class LoopedVideoTransformer(VideoTransformer):
+    def __init__(
+        self,
+        *args,
+        loop_num=4,        # fixed loop count (start here)
+        use_adaptive_halt=False,  # flip on later
+        halt_threshold=0.01,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        print("get loop number", loop_num)
+        self.n_iterations = loop_num
+    
+        self.use_adaptive_halt = use_adaptive_halt
+        
+        if use_adaptive_halt:
+            # per-position halting score from features
+            self.halt_head = nn.Sequential(
+                nn.Linear(kwargs.get('embd_dim', args[1]), 1),
+                nn.Sigmoid()
+            )
+            self.halt_threshold = halt_threshold
+
+    def forward(self, x, mask):
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(1)
+
+        # === embedding (unchanged) ===
+        x, _ = self.embd_fc(x, mask)
+        for conv, norm in zip(self.embd_convs, self.embd_norms):
+            x, mask = conv(x, mask)
+            x = F.relu(norm(x), inplace=True)
+
+        # === position encoding (unchanged) ===
+        _, _, t = x.size()
+        if self.pe is not None:
+            pe = self.pe.to(x.dtype)
+            if self.training:
+                assert t <= self.max_seq_len
+            else:
+                if t > self.max_seq_len:
+                    pe = F.interpolate(
+                        pe[None], size=t, mode='linear', align_corners=True
+                    )[0]
+            x = x + pe[..., :t] * mask.to(x.dtype)
+
+        # === LOOPED STEM ===
+        if not self.use_adaptive_halt:
+            # Phase 1: fixed iterations — weight-shared
+            for i in range(self.n_iterations):
+                for block in self.stem:
+                    x, mask = block(x, mask)
+        else:
+            # Phase 2: adaptive halting (ACT-style)
+            bs, c, t = x.size()
+            halted = torch.zeros(bs, 1, t, device=x.device, dtype=torch.bool)
+            cumul_halt = torch.zeros(bs, 1, t, device=x.device)
+            running_x = x.clone()
+            
+            for i in range(self.n_iterations):  # n_iterations = max cap
+                for block in self.stem:
+                    running_x, mask = block(running_x, mask)
+                
+                # (bs, c, t) -> (bs, t, c) -> halt score -> (bs, 1, t)
+                h = self.halt_head(running_x.transpose(1, 2)).transpose(1, 2)
+                cumul_halt = cumul_halt + h
+                
+                # positions that just crossed threshold
+                newly_halted = (cumul_halt >= 1.0) & ~halted
+                
+                # update only non-halted positions
+                update_mask = (~halted).float()
+                x = x * (1 - update_mask) + running_x * update_mask
+                
+                halted = halted | newly_halted
+                
+                if halted.all():
+                    break
+
+        # === branch layers (unchanged) ===
+        fpn, fpn_masks = tuple(), tuple()
+        for block in self.branch:
+            x, mask = block(x, mask)
+            fpn += (x,)
+            fpn_masks += (mask,)
+
+        return fpn, fpn_masks
+
+@register_video_net('all_looped_transformer')
+class LoopedVideoTransformer(VideoTransformer):
+    def __init__(
+        self,
+        *args,
+        embd_dim,
+        n_heads,
+        mha_win_size,
+        use_loop_embed,
+        attn_pdrop,
+        proj_pdrop,
+        path_pdrop,
+        loop_num=4,        # fixed loop count (start here)
+        use_adaptive_halt=False,  # flip on later
+        halt_threshold=0.01,
+        **kwargs,
+    ):
+        # pass shared args to parent explicitly
+        super().__init__(
+            *args,
+            embd_dim=embd_dim,
+            n_heads=n_heads,
+            mha_win_size=mha_win_size,
+            attn_pdrop=attn_pdrop,
+            proj_pdrop=proj_pdrop,
+            path_pdrop=path_pdrop,
+            **kwargs,
+        )
+        print("get loop number", loop_num)
+        self.n_iterations = loop_num
+    
+        self.use_adaptive_halt = use_adaptive_halt
+        self.stem = nn.ModuleList()
+        
+        self.stem.append(
+            LoopedTransformerBlock(
+                embd_dim, n_heads=n_heads,
+                window_size=mha_win_size,
+                conv_kernel=3,
+                max_loops=loop_num,
+                attn_pdrop=attn_pdrop,
+                proj_pdrop=proj_pdrop,
+                path_pdrop=path_pdrop,
+                use_loop_embed=use_loop_embed,
+            )
+        )
+    
+        
+        if use_adaptive_halt:
+            # per-position halting score from features
+            self.halt_head = nn.Sequential(
+                nn.Linear(kwargs.get('embd_dim', args[1]), 1),
+                nn.Sigmoid()
+            )
+            self.halt_threshold = halt_threshold
+
+    def forward(self, x, mask):
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(1)
+
+        # === embedding (unchanged) ===
+        x, _ = self.embd_fc(x, mask)
+        for conv, norm in zip(self.embd_convs, self.embd_norms):
+            x, mask = conv(x, mask)
+            x = F.relu(norm(x), inplace=True)
+
+        # === position encoding (unchanged) ===
+        _, _, t = x.size()
+        if self.pe is not None:
+            pe = self.pe.to(x.dtype)
+            if self.training:
+                assert t <= self.max_seq_len
+            else:
+                if t > self.max_seq_len:
+                    pe = F.interpolate(
+                        pe[None], size=t, mode='linear', align_corners=True
+                    )[0]
+            x = x + pe[..., :t] * mask.to(x.dtype)
+
+        # === LOOPED STEM ===
+        if self.use_adaptive_halt:
+            # Phase 1: fixed iterations — weight-shared
+            for i in range(self.n_iterations):
+                for block in self.stem:
+                    x, mask = block(x, mask)
+        else:
+            # looped stem (THIS IS THE CHANGE)
+            for i in range(self.n_iterations):
+                for block in self.stem:
+                    x, mask = block(x, mask, loop_idx=i)
+
+        # === branch layers (unchanged) ===
+        fpn, fpn_masks = tuple(), tuple()
+        for block in self.branch:
+            x, mask = block(x, mask)
+            fpn += (x,)
+            fpn_masks += (mask,)
+
+        return fpn, fpn_masks
 
 def make_video_net(opt):
     opt = deepcopy(opt)

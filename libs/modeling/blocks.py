@@ -96,8 +96,10 @@ class MaskedConv1D(nn.Module):
             mask = torch.ones_like(x[:, :1], dtype=torch.bool)
 
         mask_float = mask.to(x.dtype)
-        x = self.conv(x * mask_float)
+        x = (x * mask_float).float().contiguous() # unable to find cudnn algorithm to run conv resolve
 
+        # x = self.conv(x * mask_float) # unable to find cudnn algorithm to run conv resolve
+        x = self.conv(x) # unable to find cudnn algorithm to run conv resolve
         if self.stride > 1:
             mask_float = F.interpolate(
                 mask_float, size=x.size(-1), mode='nearest'
@@ -200,6 +202,8 @@ class MaskedMHA(nn.Module):
             self.register_buffer('r_mask', r_mask.bool(), persistent=False)
         else:
             self.l_mask = self.r_mask = None
+        
+        self._last_attn_weights = None  # for analysis
 
     def _chunk(self, x, size):
         """
@@ -367,7 +371,7 @@ class MaskedMHA(nn.Module):
             attn = self._attn_normalize(attn, kv_mask.transpose(1, 2))
             attn = self.attn_drop(attn)
             attn = attn.view(bs * h, -1, w)
-
+            self._last_attn_weights = attn.detach()  # (bs, h, t1, t2)
             # attention-weighted sum of values: # (bs * h, t, d)
             q = self._attn_value_matmul(attn, v)
             q = q.view(bs, h, -1, d)
@@ -382,6 +386,7 @@ class MaskedMHA(nn.Module):
                 value=float('-inf'),
             )
             attn = F.softmax(attn, dim=-1)
+            self._last_attn_weights = attn.detach()  # (bs, h, t1, t2)
             attn = self.attn_drop(attn)
             q = attn @ v                                    # (bs, h, t1, d)
 
@@ -455,7 +460,7 @@ class ConvAttNLayer(nn.Module):
             n_heads=n_heads, window_size=window_size,
             attn_pdrop=attn_pdrop, proj_pdrop=proj_pdrop,
         )
-
+        self._last_attn_weights = None
     def forward(self, x, mask):
         if self.use_conv:
             k, _ = self.k_conv(x, mask)
@@ -467,6 +472,7 @@ class ConvAttNLayer(nn.Module):
         else:
             q = k = v = x
         out = self.attn(q, k, v, mask)
+        self._last_attn_weights = self.attn._last_attn_weights
         return out, mask
 
 
@@ -507,6 +513,8 @@ class ConvXAttNLayer(nn.Module):
             n_heads=n_heads, attn_pdrop=attn_pdrop, proj_pdrop=proj_pdrop,
         )
 
+        self._last_attn_weights = None
+
     def forward(self, q, q_mask, kv, kv_mask, kv_size=None):
         if self.use_conv:
             q, q_mask = self.q_conv(q, q_mask)
@@ -514,6 +522,8 @@ class ConvXAttNLayer(nn.Module):
         out = self.xattn(q, kv, None, kv_mask, kv_size)
         if kv_size is not None and out.size(0) != q_mask.size(0):
             q_mask = q_mask.repeat_interleave(kv_size, dim=0)
+        
+        self._last_attn_weights = self.xattn._last_attn_weights
         return out, q_mask
 
 
@@ -571,7 +581,7 @@ class TransformerEncoder(nn.Module):
         self.ffn = FFN(embd_dim, expansion, proj_pdrop)
         self.ln_ffn = LayerNorm(embd_dim)
         self.drop_path_ffn = LayerScale(embd_dim, path_pdrop)
-
+        self._last_attn_weights = None
     def forward(self, x, mask):
         if mask is None:
             mask = torch.ones_like(x[:, :1], dtype=torch.bool)
@@ -580,6 +590,7 @@ class TransformerEncoder(nn.Module):
         # local self-attention (optionally with depth-wise conv)
         skip = self.attn_skip(x, mask)[0] if self.attn_skip is not None else x
         h, mask = self.attn(self.ln_attn(x), mask)
+        self._last_attn_weights = self.attn._last_attn_weights
         x = skip * mask.to(x.dtype) + self.drop_path_attn(h)
 
         # FFN
@@ -625,7 +636,7 @@ class TransformerDecoder(nn.Module):
         self.ffn = FFN(embd_dim, expansion, proj_pdrop)
         self.ln_ffn = LayerNorm(embd_dim)
         self.drop_path_ffn = LayerScale(embd_dim, path_pdrop)
-
+        self._last_attn_weights = None
     def forward(self, q, q_mask, kv, kv_mask, kv_size=None):
         if q_mask is None:
             q_mask = torch.ones_like(q[:, :1], dtype=torch.bool)
@@ -635,6 +646,7 @@ class TransformerDecoder(nn.Module):
         h, q_mask = self.xattn(
             self.ln_xattn_q(q), q_mask, self.ln_xattn_kv(kv), kv_mask, kv_size
         )
+        self._last_attn_weights = self.xattn._last_attn_weights
         if kv_size is not None and q.size(0) != h.size(0):
             q = q.repeat_interleave(kv_size, dim=0)
         q = self.adaln(q * q_mask.to(q.dtype))
@@ -690,3 +702,220 @@ def drop_path(x, drop_prob=0.0, training=False):
     mask = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
     x = x.div(keep_prob) * mask.floor_()
     return x
+
+class LoopedTransformerBlock(nn.Module):
+    """
+    A single transformer block designed for weight-tied looping.
+    Always stride=1 (no downsampling — that's handled separately).
+    
+    Uses ConvSwiGLU instead of vanilla FFN for local temporal mixing.
+    Optionally accepts a loop index embedding for per-iteration modulation.
+    """
+    def __init__(
+        self,
+        embd_dim,
+        n_heads=4,
+        window_size=0,
+        expansion=4,
+        conv_kernel=3,
+        attn_pdrop=0.0,
+        proj_pdrop=0.0,
+        path_pdrop=0.0,
+        use_loop_embed=False,
+        max_loops=8,
+    ):
+        super().__init__()
+
+        # self-attention (no stride)
+        self.attn = ConvAttNLayer(
+            embd_dim,
+            stride=1, n_heads=n_heads, window_size=window_size,
+            attn_pdrop=attn_pdrop, proj_pdrop=proj_pdrop,
+        )
+        self.ln_attn = LayerNorm(embd_dim)
+        self.drop_path_attn = LayerScale(embd_dim, path_pdrop)
+
+        # ConvSwiGLU replaces vanilla FFN
+        self.ffn = ConvSwiGLU(embd_dim, expansion, conv_kernel, proj_pdrop)
+        self.ln_ffn = LayerNorm(embd_dim)
+        self.drop_path_ffn = LayerScale(embd_dim, path_pdrop)
+
+        # optional: per-iteration modulation (à la LoopFormer / DiT)
+        self.use_loop_embed = use_loop_embed
+        if use_loop_embed:
+            self.loop_embed = nn.Embedding(max_loops, embd_dim)
+            # adaLN-style: predict scale and shift from loop index
+            self.loop_mod = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(embd_dim, 4 * embd_dim),  # scale/shift for attn + ffn
+            )
+
+    def forward(self, x, mask, loop_idx=None):
+        """
+        x: (B, C, T), mask: (B, 1, T)
+        loop_idx: int or None, current iteration index
+        """
+        if mask is None:
+            mask = torch.ones_like(x[:, :1], dtype=torch.bool)
+
+        # optional loop-index modulation
+        if self.use_loop_embed and loop_idx is not None:
+            idx = torch.tensor([loop_idx], dtype=torch.long, device=x.device)
+            le = self.loop_embed(idx).squeeze(0)  # (C,)
+            mods = self.loop_mod(le)  # (4*C,)
+            s_attn, b_attn, s_ffn, b_ffn = mods.chunk(4)
+            # reshape for broadcasting: (C,) -> (1, C, 1)
+            s_attn = (1 + s_attn).view(1, -1, 1)
+            b_attn = b_attn.view(1, -1, 1)
+            s_ffn = (1 + s_ffn).view(1, -1, 1)
+            b_ffn = b_ffn.view(1, -1, 1)
+        else:
+            s_attn = s_ffn = 1.0
+            b_attn = b_ffn = 0.0
+
+        x = x * mask.to(x.dtype)
+
+        # self-attention with modulated LayerNorm
+        h_norm = self.ln_attn(x) * s_attn + b_attn
+        h, mask = self.attn(h_norm, mask)
+        x = x * mask.to(x.dtype) + self.drop_path_attn(h)
+
+        # ConvSwiGLU with modulated LayerNorm
+        h_norm = self.ln_ffn(x) * s_ffn + b_ffn
+        h = self.ffn(h_norm, mask) * mask.to(x.dtype)
+        x = x + self.drop_path_ffn(h)
+
+        return x, mask
+
+class ConvSwiGLU(nn.Module):
+    """
+    SwiGLU FFN augmented with depthwise temporal convolution.
+    Replaces point-wise FFN with local token mixing.
+    
+    x -> Linear -> SiLU (gate branch)
+      -> Linear -> DWConv1D (value branch, local temporal mixing)
+      -> gate * value -> Linear -> out
+    """
+    def __init__(self, embd_dim, expansion=4, kernel_size=3, proj_pdrop=0.0):
+        super().__init__()
+        hidden = embd_dim * expansion
+        # gate and value projections
+        self.fc_gate = MaskedConv1D(embd_dim, hidden, 1)
+        self.fc_value = MaskedConv1D(embd_dim, hidden, 1)
+        # depthwise temporal conv on value branch
+        self.dwconv = MaskedConv1D(
+            hidden, hidden, kernel_size,
+            padding=kernel_size // 2,
+            groups=hidden,       # depthwise
+            bias=True
+        )
+        # output projection
+        self.fc_out = MaskedConv1D(hidden, embd_dim, 1)
+        self.drop = nn.Dropout(proj_pdrop)
+
+    def forward(self, x, mask):
+        """
+        x: (B, C, T), mask: (B, 1, T)
+        """
+        gate, _ = self.fc_gate(x, mask)
+        gate = F.silu(gate)
+
+        value, _ = self.fc_value(x, mask)
+        value, _ = self.dwconv(value, mask)   # local temporal mixing
+
+        out = gate * value
+        out, _ = self.fc_out(out, mask)
+        return self.drop(out)
+
+
+class LoopedTransformerDecoder(nn.Module):
+    """
+    TransformerDecoder modified for weight-tied looping.
+    Changes from original:
+      - FFN replaced with ConvSwiGLU (local temporal mixing)
+      - Optional loop embedding for per-iteration modulation
+      - Forward accepts loop_idx
+    """
+    def __init__(
+        self,
+        embd_dim,
+        kv_dim,
+        n_heads=4,
+        expansion=4,
+        attn_pdrop=0.0,
+        proj_pdrop=0.0,
+        path_pdrop=0.0,
+        xattn_mode='adaln',
+        conv_kernel=3,
+        use_loop_embed=False,
+        max_loops=8,
+    ):
+        super().__init__()
+
+        # cross-attention (same as original)
+        assert xattn_mode in ('affine', 'adaln')
+        self.xattn = ConvXAttNLayer(
+            embd_dim, kv_dim, embd_dim * 2,
+            stride=1, n_heads=n_heads,
+            attn_pdrop=attn_pdrop, proj_pdrop=proj_pdrop,
+        )
+        self.ln_xattn_q = LayerNorm(embd_dim)
+        self.ln_xattn_kv = LayerNorm(kv_dim)
+
+        if xattn_mode == 'adaln':
+            self.adaln = LayerNorm(embd_dim, affine=False)
+        else:
+            self.adaln = nn.Identity()
+
+        # ConvSwiGLU replaces vanilla FFN
+        self.ffn = ConvSwiGLU(embd_dim, expansion, conv_kernel, proj_pdrop)
+        self.ln_ffn = LayerNorm(embd_dim)
+        self.drop_path_ffn = LayerScale(embd_dim, path_pdrop)
+
+        # optional loop embedding
+        self.use_loop_embed = use_loop_embed
+        if use_loop_embed:
+            self.loop_embed = nn.Embedding(max_loops, embd_dim)
+            self.loop_mod = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(embd_dim, 2 * embd_dim),  # scale/shift for FFN only
+            )
+
+        self._last_attn_weights = None
+
+    def forward(self, q, q_mask, kv, kv_mask, kv_size=None, loop_idx=None):
+        if q_mask is None:
+            q_mask = torch.ones_like(q[:, :1], dtype=torch.bool)
+        q = q * q_mask.to(q.dtype)
+
+        # === cross-attention to text (re-attend every iteration) ===
+        h, q_mask = self.xattn(
+            self.ln_xattn_q(q), q_mask,
+            self.ln_xattn_kv(kv), kv_mask, kv_size
+        )
+        self._last_attn_weights = self.xattn._last_attn_weights
+
+        if kv_size is not None and q.size(0) != h.size(0):
+            q = q.repeat_interleave(kv_size, dim=0)
+
+        # adaLN modulation from cross-attention (same as original)
+        q = self.adaln(q * q_mask.to(q.dtype))
+        scale, shift = h.chunk(2, dim=1)
+        q = q * scale + shift
+
+        # === ConvSwiGLU with optional loop modulation ===
+        if self.use_loop_embed and loop_idx is not None:
+            idx = torch.tensor([loop_idx], dtype=torch.long, device=q.device)
+            le = self.loop_embed(idx).squeeze(0)
+            mods = self.loop_mod(le)
+            s_ffn, b_ffn = mods.chunk(2)
+            s_ffn = (1 + s_ffn).view(1, -1, 1)
+            b_ffn = b_ffn.view(1, -1, 1)
+            h_norm = self.ln_ffn(q) * s_ffn + b_ffn
+        else:
+            h_norm = self.ln_ffn(q)
+
+        h = self.ffn(h_norm, q_mask) * q_mask.to(q.dtype)
+        q = q + self.drop_path_ffn(h)
+
+        return q, q_mask
