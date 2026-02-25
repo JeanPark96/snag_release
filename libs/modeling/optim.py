@@ -31,8 +31,13 @@ def make_optimizer(model, opt):
                 no_decay.add(fpn)
             elif pn.endswith('bkgd_token'):
                 no_decay.add(fpn)
+            elif pn.endswith('refine_lambda'):
+                no_decay.add(fpn)
+            elif pn.endswith('latent_tokens'):
+                no_decay.add(fpn)
             if isinstance(m, nn.Embedding):
                 no_decay.add(fpn)
+            
 
     param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
     inter_params = decay & no_decay

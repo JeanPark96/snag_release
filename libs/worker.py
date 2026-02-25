@@ -209,6 +209,95 @@ class Trainer:
             'total': total_loss.detach(),
             'norm': norm.detach(),
         }
+    # def _microbatch_forward_backward(self, data_list, is_last=False):
+    #     vid, vid_masks, text, text_masks, text_size = self._batchify(
+    #         vid_list=[d['vid'] for d in data_list],
+    #         text_list=[d['text'] for d in data_list]
+    #     )
+    #     vid = vid.cuda(non_blocking=True)
+    #     vid_masks = vid_masks.cuda(non_blocking=True)
+    #     text = text.cuda(non_blocking=True)
+    #     text_masks = text_masks.cuda(non_blocking=True)
+    #     text_size = text_size.cuda(non_blocking=True)
+
+    #     targets = torch.cat([d['target'] / self.vid_stride for d in data_list])
+    #     targets = targets.cuda(non_blocking=True)
+
+    #     # forward pass — now returns intermediate predictions
+    #     if is_last or not self.opt['_distributed']:
+    #         fpn_logits, fpn_offsets, fpn_masks, all_logits, all_offsets = \
+    #             self.model(vid, vid_masks, text, text_masks, text_size)
+    #     else:
+    #         with self.model.no_sync():
+    #             fpn_logits, fpn_offsets, fpn_masks, all_logits, all_offsets = \
+    #                 self.model(vid, vid_masks, text, text_masks, text_size)
+
+    #     fpn_n_points = [m.size(-1) for m in fpn_masks]
+    #     fpn_points = self.pt_gen(fpn_n_points)
+    #     points = torch.cat(fpn_points)
+    #     gt_labels, gt_offsets = self._annotate_points(points, targets)
+
+    #     # === compute loss for ALL iterations ===
+    #     total_loss = 0
+    #     final_cls_loss = None
+    #     final_reg_loss = None
+
+    #     # for iter_idx in range(len(all_logits)):
+    #     #     iter_logits = torch.cat(all_logits[iter_idx], dim=1)
+    #     #     iter_offsets = torch.cat(all_offsets[iter_idx], dim=1)
+    #     #     iter_masks = torch.cat(fpn_masks, dim=1)
+
+    #     #     pos_masks = torch.logical_and(gt_labels, iter_masks)
+    #     #     norm = max(pos_masks.sum().item(), 1)
+
+    #     #     cls_loss_i = self._calc_focal_loss(
+    #     #         logits=iter_logits[iter_masks],
+    #     #         labels=gt_labels[iter_masks]
+    #     #     ) / self.loss_norm * get_world_size()
+
+    #     #     reg_loss_i = self._calc_iou_loss(
+    #     #         pred_offsets=iter_offsets[pos_masks],
+    #     #         gt_offsets=gt_offsets[pos_masks]
+    #     #     ) / self.loss_norm * get_world_size()
+
+    #     #     # weight: final iteration = 1.0, intermediate = 0.5
+    #     #     is_final = (iter_idx == len(all_logits) - 1)
+    #     #     weight = 1.0 if is_final else 0.5
+
+    #     #     total_loss += weight * (cls_loss_i + self.loss_weight * reg_loss_i)
+
+    #     #     if is_final:
+    #     #         final_cls_loss = cls_loss_i.detach()
+    #     #         final_reg_loss = reg_loss_i.detach()
+
+    #     # total_loss.backward()
+
+    #     iter_logits = torch.cat(all_logits[-1], dim=1)
+    #     iter_offsets = torch.cat(all_offsets[-1], dim=1)
+    #     iter_masks = torch.cat(fpn_masks, dim=1)
+
+    #     pos_masks = torch.logical_and(gt_labels, iter_masks)
+
+    #     cls_loss = self._calc_focal_loss(
+    #         logits=iter_logits[iter_masks],
+    #         labels=gt_labels[iter_masks]
+    #     ) / self.loss_norm * get_world_size()
+
+    #     reg_loss = self._calc_iou_loss(
+    #         pred_offsets=iter_offsets[pos_masks],
+    #         gt_offsets=gt_offsets[pos_masks]
+    #     ) / self.loss_norm * get_world_size()
+
+    #     total_loss = cls_loss + self.loss_weight * reg_loss
+    #     total_loss.backward()
+
+    #     return {
+    #         'cls': cls_loss.detach(),
+    #         'reg': reg_loss.detach(),
+    #         'total': total_loss.detach(),
+    #         'norm': pos_masks.sum().detach(),
+    #     }
+
 
     def _batchify_videos(self, vid_list):
         """

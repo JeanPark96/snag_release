@@ -2,7 +2,7 @@
 
 MAX_RETRIES=5
  
-names=(charades_sta_i3d_mind_enc charades_sta_i3d_mind_enc_dec charades_sta_i3d_mind_dec charades_sta_i3d_mind_enc_swiglu charades_sta_i3d_mind_enc_dec_swiglu charades_sta_i3d_mind_dec_swiglu)
+names=(charades_sta_i3d_mind_enc_latent)
 seeds=(101 303 404)
 
 for seed in "${seeds[@]}"; do
@@ -25,15 +25,3 @@ for seed in "${seeds[@]}"; do
     python ./eval.py --name "${name}_${seed}" --ckpt last
   done
 done
-# for seed in "${seeds[@]}"; do
-#   success=0
-#   for i in $(seq 1 "$MAX_RETRIES"); do
-#       if python ./train.py --opt video_centric/charades_sta_i3d_pred_fuse.yaml --name charades_sta_i3d_loop_pred_fuse_final_${seed} --seed ${seed}; then
-#           success=1
-#           break
-#       fi
-#       echo "Crashed. Retrying in 10s..."
-#       sleep 10
-#   done
-#   python ./eval.py --name charades_sta_i3d_loop_pred_fuse_final_${seed} --ckpt last
-# done

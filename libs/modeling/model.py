@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+from .blocks import MaskedConv1D
 from .fusion import make_fusion
 from .head import make_head
 from .text_net import make_text_net
@@ -67,7 +68,111 @@ class BufferList(nn.Module):
 
     def __iter__(self):
         return iter(self._buffers.values())
+    
+class PtTransformerLoop(nn.Module):
+    def __init__(self, opt):
+        super().__init__()
 
+        self.text_net = make_text_net(opt['text_net'])
+        self.vid_net = make_video_net(opt['vid_net'])
+        self.fusion = make_fusion(opt['fusion'])
+        self.cls_head = make_head(opt['cls_head'])
+        self.reg_head = make_head(opt['reg_head'])
+
+        # NEW: number of refinement iterations
+        # print(opt.keys())
+        self.n_refine = opt.get('n_iterations', 1)
+        print(self.n_refine, " iterations")
+
+        # NEW: project prediction (3ch) → vid_dim, one per iteration
+        if self.n_refine > 1:
+            vid_dim = opt['vid_net']['embd_dim']
+            self.feedback_projs = nn.ModuleList([
+                MaskedConv1D(3, vid_dim, 1)
+                for _ in range(self.n_refine - 1)
+            ])
+            # initialize near zero so iteration 0 matches baseline
+            for proj in self.feedback_projs:
+                nn.init.zeros_(proj.conv.weight)
+                if proj.conv.bias is not None:
+                    nn.init.zeros_(proj.conv.bias)
+
+    def encode_text(self, tokens, token_masks):
+        text, text_masks = self.text_net(tokens, token_masks)
+        return text, text_masks
+
+    def encode_video(self, vid, vid_masks):
+        fpn, fpn_masks = self.vid_net(vid, vid_masks)
+        return fpn, fpn_masks
+
+    def fuse_and_predict(self, fpn, fpn_masks, text, text_masks, text_size=None):
+        fpn_orig = fpn
+        fpn_masks_orig = fpn_masks  # <-- save original masks too
+        all_logits, all_offsets = [], []
+
+        for i in range(self.n_refine):
+            # always feed original-shaped masks into fusion
+            fused, fused_masks = self.fusion(
+                fpn, fpn_masks_orig, text, text_masks, text_size
+            )
+
+            fpn_logits, _ = self.cls_head(fused, fused_masks)
+            fpn_offsets, fpn_masks_out = self.reg_head(fused, fused_masks)
+
+            all_logits.append(fpn_logits)
+            all_offsets.append(fpn_offsets)
+
+            if i < self.n_refine - 1:
+                new_fpn = []
+                for l in range(len(fpn_orig)):
+                    # add this right before the sig = torch.cat line
+                    # print(f"fpn_logits type: {type(fpn_logits)}, len: {len(fpn_logits)}")
+                    # print(f"fpn_logits[0] shape: {fpn_logits[0].shape}")
+                    # print(f"fpn_offsets[0] shape: {fpn_offsets[0].shape}")
+                    # print(f"fused_masks type: {type(fused_masks)}, fused_masks[0] shape: {fused_masks[0].shape}")
+                    sig = torch.cat([
+                        fpn_logits[l].detach().sigmoid().unsqueeze(1),
+                        fpn_offsets[l].detach().permute(0, 2, 1),
+                    ], dim=1)
+
+                    # use expanded masks for the projection
+                    fb, _ = self.feedback_projs[i](
+                        sig, fused_masks[l]
+                    )
+
+                    # aggregate back to original batch if expanded
+                    if fb.size(0) != fpn_orig[l].size(0):
+                        splits = text_size.tolist()
+                        fb = torch.stack([
+                            s.mean(dim=0)
+                            for s in torch.split(fb, splits, dim=0)
+                        ])
+
+                    new_fpn.append(fpn_orig[l] + fb)
+
+                fpn = tuple(new_fpn)
+
+        return fpn_logits, fpn_offsets, fpn_masks_out, all_logits, all_offsets
+
+    def forward(self, vid, vid_masks, text, text_masks, text_size=None):
+        if text.ndim == 4:
+            text = torch.cat([t[:k] for t, k in zip(text, text_size)])
+        if text_masks.ndim == 3:
+            text_masks = torch.cat(
+                [t[:k] for t, k in zip(text_masks, text_size)]
+            )
+
+        text, text_masks = self.encode_text(text, text_masks)
+        fpn, fpn_masks = self.encode_video(vid, vid_masks)
+
+        result = self.fuse_and_predict(
+            fpn, fpn_masks, text, text_masks, text_size
+        )
+
+        # unpack: final predictions + intermediate lists
+        fpn_logits, fpn_offsets, fpn_masks, all_logits, all_offsets = result
+
+        return fpn_logits, fpn_offsets, fpn_masks, all_logits, all_offsets
 
 class PtGenerator(nn.Module):
     """

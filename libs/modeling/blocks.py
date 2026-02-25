@@ -328,7 +328,8 @@ class MaskedMHA(nn.Module):
         out = out.view(n, t, d)
         return out
 
-    def forward(self, q, k=None, v=None, kv_mask=None, kv_size=None):
+    def forward(self, q, k=None, v=None, kv_mask=None, kv_size=None, 
+                prev_attn=None, refine_lambda=None):
         """
         Args:
             q (float tensor, (bs, c, t1)): query feature sequence.
@@ -367,11 +368,17 @@ class MaskedMHA(nn.Module):
             attn = self._query_key_matmul(q * self.scale, k * self.scale)
             attn = attn.view(bs, h, -1, w)
 
+            # MIND: refinement for local attention
+            if prev_attn is not None and refine_lambda is not None:
+                attn = attn + refine_lambda * torch.log(prev_attn + 1e-6)
+
             # normalized attention map: (bs, h, t, w)
             attn = self._attn_normalize(attn, kv_mask.transpose(1, 2))
             attn = self.attn_drop(attn)
-            attn = attn.view(bs * h, -1, w)
+
             self._last_attn_weights = attn.detach()  # (bs, h, t1, t2)
+            attn = attn.view(bs * h, -1, w)
+
             # attention-weighted sum of values: # (bs * h, t, d)
             q = self._attn_value_matmul(attn, v)
             q = q.view(bs, h, -1, d)
@@ -381,6 +388,11 @@ class MaskedMHA(nn.Module):
             v = v.view(bs, h, d, -1).transpose(2, 3)
 
             attn = (q * self.scale) @ (k * self.scale)      # (bs, h, t1, t2)
+
+            # MIND attention refinement
+            if prev_attn is not None and refine_lambda is not None:
+                attn = attn + refine_lambda * torch.log(prev_attn + 1e-6)
+
             attn = attn.masked_fill(
                 mask=torch.logical_not(kv_mask[:, :, None, :]),
                 value=float('-inf'),
@@ -461,7 +473,7 @@ class ConvAttNLayer(nn.Module):
             attn_pdrop=attn_pdrop, proj_pdrop=proj_pdrop,
         )
         self._last_attn_weights = None
-    def forward(self, x, mask):
+    def forward(self, x, mask, prev_attn=None, refine_lambda=None):
         if self.use_conv:
             k, _ = self.k_conv(x, mask)
             v, _ = self.v_conv(x, mask)
@@ -471,7 +483,9 @@ class ConvAttNLayer(nn.Module):
             v = self.v_norm(v)
         else:
             q = k = v = x
-        out = self.attn(q, k, v, mask)
+        # out = self.attn(q, k, v, mask)
+        out = self.attn(q, k, v, mask,
+                    prev_attn=prev_attn, refine_lambda=refine_lambda)
         self._last_attn_weights = self.attn._last_attn_weights
         return out, mask
 
@@ -515,11 +529,13 @@ class ConvXAttNLayer(nn.Module):
 
         self._last_attn_weights = None
 
-    def forward(self, q, q_mask, kv, kv_mask, kv_size=None):
+    def forward(self, q, q_mask, kv, kv_mask, kv_size=None,
+            prev_attn=None, refine_lambda=None):
         if self.use_conv:
             q, q_mask = self.q_conv(q, q_mask)
             q = self.q_norm(q)
-        out = self.xattn(q, kv, None, kv_mask, kv_size)
+        out = self.xattn(q, kv, None, kv_mask, kv_size,
+                    prev_attn=prev_attn, refine_lambda=refine_lambda)
         if kv_size is not None and out.size(0) != q_mask.size(0):
             q_mask = q_mask.repeat_interleave(kv_size, dim=0)
         
@@ -919,3 +935,428 @@ class LoopedTransformerDecoder(nn.Module):
         q = q + self.drop_path_ffn(h)
 
         return q, q_mask
+    
+class GTheta(nn.Module):
+    """
+    Learned per-channel damping gate for fixed-point iteration.
+    g(delta) = sigmoid(W * delta) * delta
+    Initialized so sigmoid(0) = 0.5 (half-strength updates).
+    """
+    def __init__(self, embd_dim):
+        super().__init__()
+        self.proj = MaskedConv1D(embd_dim, embd_dim, 1)
+        nn.init.zeros_(self.proj.conv.weight)
+        if self.proj.conv.bias is not None:
+            nn.init.zeros_(self.proj.conv.bias)
+
+    def forward(self, delta, mask):
+        gate, _ = self.proj(delta, mask)
+        return torch.sigmoid(gate) * delta
+
+class MINDEncoderBlock(nn.Module):
+    """
+    Single weight-tied encoder block with MIND modifications.
+    Reuses ConvAttNLayer for self-attention and existing FFN.
+
+    Adds:
+      - Attention refinement via prev_attn (global attention only)
+      - g_theta damping on both attention and FFN residuals
+      - Optional ConvSwiGLU FFN replacement
+    """
+    def __init__(
+        self,
+        embd_dim,
+        n_heads=4,
+        stride=1,
+        window_size=0,
+        attn_pdrop=0.0,
+        proj_pdrop=0.0,
+        path_pdrop=0.0,
+        use_conv_swiglu=False,
+        conv_kernel=3,
+    ):
+        super().__init__()
+
+        # reuse existing self-attention layer
+        self.ln_attn = LayerNorm(embd_dim)
+        self.self_attn = ConvAttNLayer(
+            embd_dim,
+            stride=stride,
+            n_heads=n_heads,
+            window_size=window_size,
+            attn_pdrop=attn_pdrop,
+            proj_pdrop=proj_pdrop,
+        )
+
+        # FFN
+        self.ln_ffn = LayerNorm(embd_dim)
+        if use_conv_swiglu:
+            self.ffn = ConvSwiGLU(
+                embd_dim, kernel_size=conv_kernel, proj_pdrop=proj_pdrop
+            )
+        else:
+            self.ffn = FFN(embd_dim, pdrop=proj_pdrop)
+
+        # MIND: damping gates
+        self.g_attn = GTheta(embd_dim)
+        self.g_ffn = GTheta(embd_dim)
+
+        # MIND: learnable refinement strength
+        self.refine_lambda = nn.Parameter(torch.zeros(1))
+
+        # stochastic depth
+        self.drop_path_attn = LayerScale(embd_dim, path_pdrop)
+        self.drop_path_ffn = LayerScale(embd_dim, path_pdrop)
+
+    def forward(self, x, mask, prev_attn=None):
+        """
+        Args:
+            x: (B, C, T)
+            mask: (B, 1, T)
+            prev_attn: previous iteration's attention weights, or None
+
+        Returns:
+            x, mask, attn_weights
+        """
+        # ----- self-attention with refinement -----
+        residual = x
+        lam = self.refine_lambda.sigmoid()
+        attn_out, mask = self.self_attn(
+            self.ln_attn(x), mask,
+            prev_attn=prev_attn, refine_lambda=lam
+        )
+        attn_update = self.g_attn(attn_out, mask)
+        x = residual + self.drop_path_attn(attn_update)
+        x = x * mask.float()
+
+        # grab attention weights for next iteration
+        attn_weights = self.self_attn._last_attn_weights
+
+        # ----- FFN with damping -----
+        residual = x
+        if isinstance(self.ffn, ConvSwiGLU):
+            ffn_out = self.ffn(self.ln_ffn(x), mask)
+        else:
+            ffn_out = self.ffn(self.ln_ffn(x))
+        ffn_update = self.g_ffn(ffn_out, mask)
+        x = residual + self.drop_path_ffn(ffn_update)
+        x = x * mask.float()
+
+        return x, mask, attn_weights
+    
+class MINDFusionBlock(nn.Module):
+    """
+    Single weight-tied fusion block with MIND modifications.
+    Reuses ConvXAttNLayer for cross-attention and existing FFN.
+
+    Adds:
+      - Cross-attention refinement via prev_attn
+      - g_theta damping on FFN residual
+      - adaLN modulation from cross-attention output (as in original SnAG)
+      - Optional ConvSwiGLU FFN replacement
+    """
+    def __init__(
+        self,
+        vid_dim,
+        text_dim,
+        n_heads=4,
+        stride=1,
+        attn_pdrop=0.0,
+        proj_pdrop=0.0,
+        path_pdrop=0.0,
+        xattn_mode='adaln',
+        use_conv_swiglu=False,
+        conv_kernel=3,
+    ):
+        super().__init__()
+        self.xattn_mode = xattn_mode
+
+        # reuse existing cross-attention layer
+        self.ln_xattn = LayerNorm(vid_dim)
+        self.cross_attn = ConvXAttNLayer(
+            vid_dim,
+            kv_dim=text_dim,
+            stride=stride,
+            n_heads=n_heads,
+            attn_pdrop=attn_pdrop,
+            proj_pdrop=proj_pdrop,
+        )
+
+        # FFN
+        self.ln_ffn = LayerNorm(vid_dim)
+        if use_conv_swiglu:
+            self.ffn = ConvSwiGLU(
+                vid_dim, kernel_size=conv_kernel, proj_pdrop=proj_pdrop
+            )
+        else:
+            self.ffn = FFN(vid_dim, pdrop=proj_pdrop)
+
+        # MIND: damping gate on FFN
+        self.g_ffn = GTheta(vid_dim)
+
+        # MIND: learnable refinement strength
+        self.refine_lambda = nn.Parameter(torch.zeros(1))
+
+        # adaLN modulation (same as original SnAG XAttNFusion)
+        if xattn_mode == 'adaln':
+            self.adaln_scale = MaskedConv1D(vid_dim, vid_dim, 1)
+            self.adaln_bias = MaskedConv1D(vid_dim, vid_dim, 1)
+
+        # stochastic depth
+        self.drop_path_ffn = LayerScale(vid_dim, path_pdrop)
+        if xattn_mode != 'adaln':
+            self.drop_path_xattn = LayerScale(vid_dim, path_pdrop)
+
+    def forward(self, q, q_mask, kv, kv_mask, kv_size=None, prev_attn=None):
+        """
+        Args:
+            q:      (B, C, T_v)   video features (pre-expansion)
+            q_mask: (B, 1, T_v)
+            kv:     (B', C_t, T_t) text features
+            kv_mask:(B', 1, T_t)
+            kv_size: (B,) number of text queries per video
+            prev_attn: previous iteration's cross-attention weights
+
+        Returns:
+            q, q_mask, attn_weights
+        """
+        # ----- cross-attention with refinement -----
+        lam = self.refine_lambda.sigmoid()
+        xattn_out, q_mask = self.cross_attn(
+            self.ln_xattn(q), q_mask, kv, kv_mask, kv_size,
+            prev_attn=prev_attn, refine_lambda=lam
+        )
+
+        attn_weights = self.cross_attn._last_attn_weights
+
+        if self.xattn_mode == 'adaln':
+            # cross-attn output modulates video features (original SnAG design)
+            scale, _ = self.adaln_scale(xattn_out, q_mask)
+            bias, _ = self.adaln_bias(xattn_out, q_mask)
+            q = q * q_mask.float()
+            # handle batch expansion from kv_size
+            if kv_size is not None and q.size(0) != scale.size(0):
+                q = q.repeat_interleave(kv_size, dim=0)
+            q = q * (1.0 + scale) + bias
+        else:
+            if kv_size is not None and q.size(0) != xattn_out.size(0):
+                q = q.repeat_interleave(kv_size, dim=0)
+            q = q + self.drop_path_xattn(xattn_out)
+        q = q * q_mask.float()
+
+        # ----- FFN with damping -----
+        residual = q
+        if isinstance(self.ffn, ConvSwiGLU):
+            ffn_out = self.ffn(self.ln_ffn(q), q_mask)
+        else:
+            ffn_out = self.ffn(self.ln_ffn(q))
+        ffn_update = self.g_ffn(ffn_out, q_mask)
+        q = residual + self.drop_path_ffn(ffn_update)
+        q = q * q_mask.float()
+
+        return q, q_mask, attn_weights
+
+class MINDBranchLevel(nn.Module):
+    """
+    Single FPN branch level: optional downsample + MIND looped block.
+
+    If stride=2: downsample once, then loop at stride=1.
+    If stride=1: just loop.
+    """
+    def __init__(
+        self,
+        embd_dim,
+        n_iterations=4,
+        n_heads=4,
+        stride=1,
+        window_size=0,
+        attn_pdrop=0.0,
+        proj_pdrop=0.0,
+        path_pdrop=0.0,
+        use_conv_swiglu=False,
+        conv_kernel=3,
+    ):
+        super().__init__()
+        self.n_iterations = n_iterations
+        self.use_downsample = stride > 1
+
+        # downsample ONCE before looping
+        if self.use_downsample:
+            self.downsample = MaskedConv1D(
+                embd_dim, embd_dim, 3,
+                stride=stride, padding=1,
+                groups=embd_dim, bias=False
+            )
+            self.downsample_norm = LayerNorm(embd_dim)
+
+        # MIND block loops at stride=1 (no further downsampling)
+        self.block = MINDEncoderBlock(
+            embd_dim,
+            n_heads=n_heads,
+            stride=1,  # always 1 — downsampling handled above
+            window_size=window_size,
+            attn_pdrop=attn_pdrop,
+            proj_pdrop=proj_pdrop,
+            path_pdrop=path_pdrop,
+            use_conv_swiglu=use_conv_swiglu,
+            conv_kernel=conv_kernel,
+        )
+
+    def forward(self, x, mask):
+        # downsample once
+        if self.use_downsample:
+            x, mask = self.downsample(x, mask)
+            x = self.downsample_norm(x)
+
+        # MIND loop
+        prev_attn = None
+        for _ in range(self.n_iterations):
+            x, mask, prev_attn = self.block(x, mask, prev_attn)
+
+        return x, mask
+
+class MINDEncoderBlockWithLatents(nn.Module):
+    def __init__(
+        self,
+        embd_dim,
+        n_latent=8,
+        n_heads=4,
+        stride=1,
+        window_size=0,
+        attn_pdrop=0.0,
+        proj_pdrop=0.0,
+        path_pdrop=0.0,
+        use_conv_swiglu=False,
+        conv_kernel=3,
+    ):
+        super().__init__()
+        self.n_latent = n_latent
+
+        # 1. video self-attention (LOCAL, unchanged)
+        self.ln_attn = LayerNorm(embd_dim)
+        self.self_attn = ConvAttNLayer(
+            embd_dim,
+            stride=stride,
+            n_heads=n_heads,
+            window_size=window_size,  # keep local
+            attn_pdrop=attn_pdrop,
+            proj_pdrop=proj_pdrop,
+        )
+
+        # 2. video reads from latents (GLOBAL, cheap: T queries, K keys)
+        self.ln_vid2lat = LayerNorm(embd_dim)
+        self.vid2lat_attn = MaskedMHA(
+            embd_dim,
+            kv_dim=embd_dim,
+            n_heads=n_heads,
+            window_size=0,  # global, but K is small so it's cheap
+            attn_pdrop=attn_pdrop,
+            proj_pdrop=proj_pdrop,
+        )
+
+        # 3. latents read from video (GLOBAL, cheap: K queries, T keys)
+        self.ln_lat2vid = LayerNorm(embd_dim)
+        self.lat2vid_attn = MaskedMHA(
+            embd_dim,
+            kv_dim=embd_dim,
+            n_heads=n_heads,
+            window_size=0,
+            attn_pdrop=attn_pdrop,
+            proj_pdrop=proj_pdrop,
+        )
+
+        # 4. video FFN
+        self.ln_ffn = LayerNorm(embd_dim)
+        if use_conv_swiglu:
+            self.ffn = ConvSwiGLU(
+                embd_dim, kernel_size=conv_kernel, proj_pdrop=proj_pdrop
+            )
+        else:
+            self.ffn = FFN(embd_dim, pdrop=proj_pdrop)
+
+        # 5. latent FFN (lightweight)
+        self.ln_lat_ffn = LayerNorm(embd_dim)
+        self.lat_ffn = FFN(embd_dim, expansion=2, pdrop=proj_pdrop)
+
+        # MIND components
+        self.g_attn = GTheta(embd_dim)
+        self.g_vid2lat = GTheta(embd_dim)
+        self.g_ffn = GTheta(embd_dim)
+        self.refine_lambda = nn.Parameter(torch.zeros(1))
+
+        # latent tokens
+        self.latent_tokens = nn.Parameter(
+            torch.randn(1, embd_dim, n_latent) * 0.02
+        )
+
+        self.drop_path_attn = LayerScale(embd_dim, path_pdrop)
+        self.drop_path_v2l = LayerScale(embd_dim, path_pdrop)
+        self.drop_path_ffn = LayerScale(embd_dim, path_pdrop)
+
+    def forward(self, x, mask, latent=None, prev_attn=None):
+        """
+        Args:
+            x:      (B, C, T) video features
+            mask:   (B, 1, T)
+            latent: (B, C, K) or None (initialized from self.latent_tokens)
+            prev_attn: previous self-attention weights
+
+        Returns:
+            x, mask, latent, attn_weights
+        """
+        B = x.size(0)
+        if latent is None:
+            latent = self.latent_tokens.expand(B, -1, -1)
+
+        latent_mask = torch.ones(
+            B, 1, self.n_latent, device=mask.device, dtype=mask.dtype
+        )
+
+        # --- 1. local self-attention on video (SAME cost as before) ---
+        residual = x
+        lam = self.refine_lambda.sigmoid()
+        attn_out, _ = self.self_attn(
+            self.ln_attn(x), mask,
+            prev_attn=prev_attn, refine_lambda=lam
+        )
+        attn_update = self.g_attn(attn_out, mask)
+        x = residual + self.drop_path_attn(attn_update)
+        x = x * mask.float()
+        attn_weights = self.self_attn._last_attn_weights
+
+        # --- 2. video reads from latents (cost: O(T * K), K << T) ---
+        residual = x
+        v2l_out = self.vid2lat_attn(
+            self.ln_vid2lat(x),          # queries: video (B, C, T)
+            self.ln_vid2lat(latent),      # keys: latent (B, C, K)
+            kv_mask=latent_mask,
+        )
+        v2l_update = self.g_vid2lat(v2l_out, mask)
+        x = residual + self.drop_path_v2l(v2l_update)
+        x = x * mask.float()
+
+        # --- 3. latents read from video (cost: O(K * T), K << T) ---
+        latent_residual = latent
+        l2v_out = self.lat2vid_attn(
+            self.ln_lat2vid(latent),     # queries: latent (B, C, K)
+            self.ln_lat2vid(x),          # keys: video (B, C, T)
+            kv_mask=mask,
+        )
+        latent = latent_residual + l2v_out
+
+        # --- 4. video FFN ---
+        residual = x
+        if isinstance(self.ffn, ConvSwiGLU):
+            ffn_out = self.ffn(self.ln_ffn(x), mask)
+        else:
+            ffn_out = self.ffn(self.ln_ffn(x))
+        ffn_update = self.g_ffn(ffn_out, mask)
+        x = residual + self.drop_path_ffn(ffn_update)
+        x = x * mask.float()
+
+        # --- 5. latent FFN ---
+        latent_residual = latent
+        lat_ffn_out = self.lat_ffn(self.ln_lat_ffn(latent))
+        latent = latent_residual + lat_ffn_out
+
+        return x, mask, latent, attn_weights
