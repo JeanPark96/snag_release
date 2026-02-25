@@ -2,7 +2,7 @@
 
 MAX_RETRIES=5
  
-names=(charades_sta_i3d_mind_enc_latent)
+names=(charades_sta_i3d_mind_dec_swiglu_ftheta)
 seeds=(101 303 404)
 
 for seed in "${seeds[@]}"; do
@@ -10,7 +10,7 @@ for seed in "${seeds[@]}"; do
     success=0
     for i in $(seq 1 "$MAX_RETRIES"); do
       echo "=== seed=$seed name=$name Attempt $i/$MAX_RETRIES ==="
-      if python ./train.py --seed "$seed" --opt "video_centric/${name}.yaml" --name "${name}_${seed}"; then
+      if python ./train.py --seed "$seed" --opt "video_centric/${name}.yaml" --name "${name}_loop4_${seed}"; then
         success=1
         break
       fi
@@ -22,6 +22,6 @@ for seed in "${seeds[@]}"; do
       echo "FAILED after $MAX_RETRIES retries: seed=$seed name=$name" >&2
       exit 1   # or: continue  # if you prefer to keep going
     fi
-    python ./eval.py --name "${name}_${seed}" --ckpt last
+    python ./eval.py --name "${name}_loop4_${seed}" --ckpt last
   done
 done

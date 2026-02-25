@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .blocks import (
-    sinusoid_encoding, MaskedConv1D, AttNPool1D, TransformerEncoder
+    sinusoid_encoding, MaskedConv1D, AttNPool1D, TransformerEncoder, MINDEncoderBlock
 )
 
 from .weight_init import trunc_normal_
@@ -187,6 +187,107 @@ class TextTransformer(nn.Module):
             
         return x, mask
 
+@register_text_net('mind_transformer')
+class MINDTextTransformer(nn.Module):
+    """
+    Drop-in replacement for TextTransformer.
+    
+    Same structure, but transformer layers replaced with
+    single MINDEncoderBlock looped N times.
+    """
+    def __init__(
+        self,
+        in_dim,
+        embd_dim,
+        n_heads,
+        max_seq_len,
+        n_iterations=5,     # was n_layers
+        n_layers=None,       # backward compat
+        attn_pdrop=0.0,
+        proj_pdrop=0.0,
+        path_pdrop=0.0,
+        use_abs_pe=True,
+        use_bkgd_token=True,
+        use_conv_swiglu=False,
+        conv_kernel=3,
+    ):
+        super().__init__()
+
+        if n_layers is not None and n_iterations == 5:
+            n_iterations = n_layers
+        self.n_iterations = n_iterations
+        self.max_seq_len = max_seq_len
+
+        # === SAME: embedding projection ===
+        self.embd_fc = MaskedConv1D(in_dim, embd_dim, 1)
+
+        # === SAME: position encoding ===
+        if use_abs_pe:
+            pe = sinusoid_encoding(max_seq_len, embd_dim // 2)
+            pe /= embd_dim ** 0.5
+            self.register_buffer('pe', pe, persistent=False)
+        else:
+            self.pe = None
+
+        # === SAME: background token ===
+        if use_bkgd_token:
+            self.bkgd_token = nn.Parameter(torch.empty(embd_dim, 1))
+            trunc_normal_(self.bkgd_token, mean=0.0, std=0.02)
+        else:
+            self.bkgd_token = None
+
+        # === CHANGED: single MIND block looped N times ===
+        self.loop_block = MINDEncoderBlock(
+            embd_dim,
+            n_heads=n_heads,
+            stride=0,       # no conv, same as original
+            window_size=0,   # global attention, text is short
+            attn_pdrop=attn_pdrop,
+            proj_pdrop=proj_pdrop,
+            path_pdrop=path_pdrop,
+            use_conv_swiglu=use_conv_swiglu,
+            conv_kernel=conv_kernel,
+        )
+
+        self.apply(self.__init_weights__)
+
+    def __init_weights__(self, module):
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def forward(self, x, mask):
+        bs, _, t = x.size()
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(1)
+
+        # embedding projection
+        x, _ = self.embd_fc(x, mask)
+
+        # position encoding
+        if self.pe is not None:
+            pe = self.pe.to(x.dtype)
+            if self.training:
+                assert t <= self.max_seq_len
+            else:
+                if t > self.max_seq_len:
+                    pe = F.interpolate(
+                        pe[None], size=t, mode='linear', align_corners=True
+                    )[0]
+            x = x + pe[..., :t] * mask.to(x.dtype)
+
+        # prepend background token
+        if self.bkgd_token is not None:
+            bkgd_token = self.bkgd_token.repeat(bs, 1, 1)
+            x = torch.cat((bkgd_token, x), dim=-1)
+            mask = torch.cat((mask[..., :1], mask), dim=-1)
+
+        # MIND loop
+        prev_attn = None
+        for _ in range(self.n_iterations):
+            x, mask, prev_attn = self.loop_block(x, mask, prev_attn) #stride 0 does not modify mask
+
+        return x, mask
 
 def make_text_net(opt):
     opt = deepcopy(opt)

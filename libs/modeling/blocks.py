@@ -974,9 +974,10 @@ class MINDEncoderBlock(nn.Module):
         path_pdrop=0.0,
         use_conv_swiglu=False,
         conv_kernel=3,
+        refinement_mode='log_attn'
     ):
         super().__init__()
-
+        self.refinement_mode = refinement_mode
         # reuse existing self-attention layer
         self.ln_attn = LayerNorm(embd_dim)
         self.self_attn = ConvAttNLayer(
@@ -1001,29 +1002,64 @@ class MINDEncoderBlock(nn.Module):
         self.g_attn = GTheta(embd_dim)
         self.g_ffn = GTheta(embd_dim)
 
-        # MIND: learnable refinement strength
-        self.refine_lambda = nn.Parameter(torch.zeros(1))
+        # refinement-mode-specific parameters
+        if refinement_mode == 'log_attn':
+            # our current approach: bias attention weights
+            self.refine_lambda = nn.Parameter(torch.zeros(1))
+        elif refinement_mode == 'ftheta':
+            # MIND's actual approach: feature-level transformation
+            # small bottleneck MLP: project down, nonlinearity, project back
+            self.f_theta = nn.Sequential(
+                MaskedConv1D(embd_dim, embd_dim // 4, 1),
+                nn.SiLU(),
+                MaskedConv1D(embd_dim // 4, embd_dim, 1),
+            )
+            # initialize near-zero so iteration 1 behaves like no refinement
+            nn.init.zeros_(self.f_theta[2].conv.weight)
+            if self.f_theta[2].conv.bias is not None:
+                nn.init.zeros_(self.f_theta[2].conv.bias)
 
         # stochastic depth
         self.drop_path_attn = LayerScale(embd_dim, path_pdrop)
         self.drop_path_ffn = LayerScale(embd_dim, path_pdrop)
 
-    def forward(self, x, mask, prev_attn=None):
+    def forward(self, x, mask, prev_out=None, prev_attn=None):
         """
         Args:
             x: (B, C, T)
             mask: (B, 1, T)
-            prev_attn: previous iteration's attention weights, or None
+            prev_out:  (B, C, T) previous iteration's output (for ftheta mode)
+            prev_attn: previous attention weights (for log_attn mode)
 
         Returns:
             x, mask, attn_weights
         """
+        # --- apply refinement BEFORE attention ---
+        if self.refinement_mode == 'ftheta':
+            if prev_out is not None:
+                correction, _ = self.f_theta[0](prev_out, mask)
+                correction = self.f_theta[1](correction)
+                correction, _ = self.f_theta[2](correction, mask)
+                x = x + correction
+            else:
+                # dummy pass: keeps f_theta in compute graph, adds 0
+                correction, _ = self.f_theta[0](x.detach(), mask)
+                correction = self.f_theta[1](correction)
+                correction, _ = self.f_theta[2](correction, mask)
+                x = x + correction * 0
         # ----- self-attention with refinement -----
         residual = x
-        lam = self.refine_lambda.sigmoid()
+        attn_kwargs = {}
+        if self.refinement_mode == 'log_attn':
+            lam = self.refine_lambda.sigmoid()
+            if prev_attn is not None:
+                attn_kwargs = {'prev_attn': prev_attn, 'refine_lambda': lam}
+            else:
+                # dummy: keeps refine_lambda in compute graph
+                x = x + (lam * 0)
+
         attn_out, mask = self.self_attn(
-            self.ln_attn(x), mask,
-            prev_attn=prev_attn, refine_lambda=lam
+            self.ln_attn(x), mask, **attn_kwargs
         )
         attn_update = self.g_attn(attn_out, mask)
         x = residual + self.drop_path_attn(attn_update)
@@ -1050,7 +1086,7 @@ class MINDFusionBlock(nn.Module):
     Reuses ConvXAttNLayer for cross-attention and existing FFN.
 
     Adds:
-      - Cross-attention refinement via prev_attn
+      - Cross-attention refinement via prev_attn (log_attn) or prev features (ftheta)
       - g_theta damping on FFN residual
       - adaLN modulation from cross-attention output (as in original SnAG)
       - Optional ConvSwiGLU FFN replacement
@@ -1067,9 +1103,11 @@ class MINDFusionBlock(nn.Module):
         xattn_mode='adaln',
         use_conv_swiglu=False,
         conv_kernel=3,
+        refinement_mode='log_attn',  # 'ftheta', 'log_attn', or 'none'
     ):
         super().__init__()
         self.xattn_mode = xattn_mode
+        self.refinement_mode = refinement_mode
 
         # reuse existing cross-attention layer
         self.ln_xattn = LayerNorm(vid_dim)
@@ -1094,8 +1132,20 @@ class MINDFusionBlock(nn.Module):
         # MIND: damping gate on FFN
         self.g_ffn = GTheta(vid_dim)
 
-        # MIND: learnable refinement strength
-        self.refine_lambda = nn.Parameter(torch.zeros(1))
+        # refinement-mode-specific parameters
+        if refinement_mode == 'log_attn':
+            self.refine_lambda = nn.Parameter(torch.zeros(1))
+        elif refinement_mode == 'ftheta':
+            # feature-level correction from previous iteration's output
+            self.f_theta = nn.Sequential(
+                MaskedConv1D(vid_dim, vid_dim // 4, 1),
+                nn.SiLU(),
+                MaskedConv1D(vid_dim // 4, vid_dim, 1),
+            )
+            # initialize near-zero so iteration 1 ≈ no refinement
+            nn.init.zeros_(self.f_theta[2].conv.weight)
+            if self.f_theta[2].conv.bias is not None:
+                nn.init.zeros_(self.f_theta[2].conv.bias)
 
         # adaLN modulation (same as original SnAG XAttNFusion)
         if xattn_mode == 'adaln':
@@ -1107,34 +1157,55 @@ class MINDFusionBlock(nn.Module):
         if xattn_mode != 'adaln':
             self.drop_path_xattn = LayerScale(vid_dim, path_pdrop)
 
-    def forward(self, q, q_mask, kv, kv_mask, kv_size=None, prev_attn=None):
+    def forward(self, q, q_mask, kv, kv_mask, kv_size=None,
+                prev_out=None, prev_attn=None):
         """
         Args:
-            q:      (B, C, T_v)   video features (pre-expansion)
-            q_mask: (B, 1, T_v)
-            kv:     (B', C_t, T_t) text features
-            kv_mask:(B', 1, T_t)
-            kv_size: (B,) number of text queries per video
-            prev_attn: previous iteration's cross-attention weights
+            q:         (B, C, T_v)   video features (pre-expansion)
+            q_mask:    (B, 1, T_v)
+            kv:        (B', C_t, T_t) text features
+            kv_mask:   (B', 1, T_t)
+            kv_size:   (B,) number of text queries per video
+            prev_out:  (B, C, T_v) previous iteration's output (for ftheta)
+            prev_attn: previous iteration's cross-attention weights (for log_attn)
 
         Returns:
             q, q_mask, attn_weights
         """
-        # ----- cross-attention with refinement -----
-        lam = self.refine_lambda.sigmoid()
+        # --- f_theta: feature-level refinement BEFORE cross-attention ---
+        if self.refinement_mode == 'ftheta':
+            if prev_out is not None:
+                correction, _ = self.f_theta[0](prev_out, q_mask)
+                correction = self.f_theta[1](correction)
+                correction, _ = self.f_theta[2](correction, q_mask)
+                q = q + correction
+            else:
+                correction, _ = self.f_theta[0](q.detach(), q_mask)
+                correction = self.f_theta[1](correction)
+                correction, _ = self.f_theta[2](correction, q_mask)
+                q = q + correction * 0
+
+        # ----- cross-attention (with log_attn refinement if enabled) -----
+        attn_kwargs = {}
+        if self.refinement_mode == 'log_attn':
+            lam = self.refine_lambda.sigmoid()
+            if prev_attn is not None:
+                attn_kwargs = {'prev_attn': prev_attn, 'refine_lambda': lam}
+            else:
+                q = q + (lam * 0)
+                
+
         xattn_out, q_mask = self.cross_attn(
             self.ln_xattn(q), q_mask, kv, kv_mask, kv_size,
-            prev_attn=prev_attn, refine_lambda=lam
+            **attn_kwargs
         )
 
         attn_weights = self.cross_attn._last_attn_weights
 
         if self.xattn_mode == 'adaln':
-            # cross-attn output modulates video features (original SnAG design)
             scale, _ = self.adaln_scale(xattn_out, q_mask)
             bias, _ = self.adaln_bias(xattn_out, q_mask)
             q = q * q_mask.float()
-            # handle batch expansion from kv_size
             if kv_size is not None and q.size(0) != scale.size(0):
                 q = q.repeat_interleave(kv_size, dim=0)
             q = q * (1.0 + scale) + bias

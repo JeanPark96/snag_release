@@ -35,6 +35,8 @@ def make_optimizer(model, opt):
                 no_decay.add(fpn)
             elif pn.endswith('latent_tokens'):
                 no_decay.add(fpn)
+            elif pn.endswith('ftheta'):
+                no_decay.add(fpn)
             if isinstance(m, nn.Embedding):
                 no_decay.add(fpn)
             

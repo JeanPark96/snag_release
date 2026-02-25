@@ -317,6 +317,7 @@ class MINDXAttNFusion(nn.Module):
         xattn_mode='adaln',
         use_conv_swiglu=False,
         conv_kernel=3,
+        refinement_mode="log_attn",
     ):
         super().__init__()
 
@@ -333,6 +334,7 @@ class MINDXAttNFusion(nn.Module):
             xattn_mode=xattn_mode,
             use_conv_swiglu=use_conv_swiglu,
             conv_kernel=conv_kernel,
+            refinement_mode=refinement_mode,
         )
 
         self.ln_out = LayerNorm(vid_dim)
@@ -348,20 +350,23 @@ class MINDXAttNFusion(nn.Module):
 
     def _forward(self, q, q_mask, kv, kv_mask, kv_size=None):
         self._last_attn_weights = []
-        prev_attn = None
+        prev_out, prev_attn = None, None
 
-        for _ in range(self.n_iterations):
-            q, q_mask, prev_attn = self.block(
-                q, q_mask, kv, kv_mask, kv_size, None
-            )
-            self._last_attn_weights.append(prev_attn)
-
-        q = self.ln_out(q)
-
-        if kv_size is not None and q.size(0) != kv.size(0):
+        # expand q upfront so batch dims are consistent across iterations
+        if kv_size is not None:
             q = q.repeat_interleave(kv_size, dim=0)
             q_mask = q_mask.repeat_interleave(kv_size, dim=0)
 
+        for _ in range(self.n_iterations):
+            q_prev = q  # safe now, already expanded
+            q, q_mask, prev_attn = self.block(
+                q, q_mask, kv, kv_mask, kv_size=None,  # already expanded
+                prev_out=prev_out, prev_attn=prev_attn
+            )
+            prev_out = q_prev
+            self._last_attn_weights.append(prev_attn)
+
+        q = self.ln_out(q)
         return q, q_mask
 
     def forward(self, vid, vid_masks, text, text_mask, text_size=None):

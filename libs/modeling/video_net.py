@@ -377,6 +377,7 @@ class MINDVideoTransformer(nn.Module):
         use_abs_pe=False,
         use_conv_swiglu=False,
         conv_kernel=3,
+        refinement_mode='log_attn'
     ):
         super().__init__()
 
@@ -424,6 +425,7 @@ class MINDVideoTransformer(nn.Module):
             path_pdrop=path_pdrop,
             use_conv_swiglu=use_conv_swiglu,
             conv_kernel=conv_kernel,
+            refinement_mode=refinement_mode
         )
 
         # === SAME AS ORIGINAL: branch transformers for FPN ===
@@ -480,8 +482,11 @@ class MINDVideoTransformer(nn.Module):
 
         # === CHANGED: MIND looped stem ===
         prev_attn = None
+        prev_out = None
         for _ in range(self.n_stem_iterations):
-            x, mask, prev_attn = self.stem(x, mask, prev_attn)
+            x_prev = x
+            x, mask, prev_attn = self.stem(x, mask, prev_out=prev_out, prev_attn=prev_attn)
+            prev_out = x_prev
 
         # === SAME: branch layers building FPN ===
         fpn, fpn_masks = tuple(), tuple()
@@ -520,6 +525,7 @@ class MINDVideoTransformerV2(nn.Module):
         use_conv_swiglu=False,
         conv_kernel=3,
         branch_iterations=2,  # MIND iterations per branch level
+        refinement_mode="log_attn"
     ):
         super().__init__()
 
@@ -575,6 +581,7 @@ class MINDVideoTransformerV2(nn.Module):
             path_pdrop=path_pdrop,
             use_conv_swiglu=use_conv_swiglu,
             conv_kernel=conv_kernel,
+            refinement_mode=refinement_mode
         )
 
         # === MIND branch: each level has its own looped block ===
@@ -629,9 +636,11 @@ class MINDVideoTransformerV2(nn.Module):
 
         # MIND stem loop
         prev_attn = None
+        prev_out = None
         for _ in range(self.n_stem_iterations):
-            x, mask, prev_attn = self.stem(x, mask, prev_attn)
-
+            x_prev = x
+            x, mask, prev_attn = self.stem(x, mask, prev_out, prev_attn=prev_attn)
+            prev_out = x_prev
         # MIND branch levels (each loops independently)
         fpn, fpn_masks = tuple(), tuple()
         for branch_level in self.branch:
