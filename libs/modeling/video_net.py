@@ -9,6 +9,8 @@ from .blocks import (
     MINDEncoderBlockWithLatents, sinusoid_encoding, MaskedConv1D, LayerNorm, TransformerEncoder, LoopedTransformerBlock, MINDEncoderBlock, MINDBranchLevel
 )
 
+from .halt_methods import build_halting
+
 
 backbones = dict()
 def register_video_net(name):
@@ -496,6 +498,579 @@ class MINDVideoTransformer(nn.Module):
             fpn_masks += (mask,)
 
         return fpn, fpn_masks
+
+@register_video_net('mind_transformer_act')
+class MINDVideoTransformer(nn.Module):
+    """
+    Drop-in replacement for VideoTransformer.
+
+    Identical structure:
+        video features
+        -> [embedding convs x L1]       (SAME)
+        -> [stem: MIND looped block]     (CHANGED: weight-tied with refinement)
+        -> [branch transformer x L3]     (SAME: regular TransformerEncoder for FPN)
+        -> latent video feature pyramid
+
+    arch = (n_embd_convs, n_stem_iterations, n_branch_transformers)
+    NOTE: arch[1] now means number of MIND iterations, not number of stem layers.
+    """
+    def __init__(
+        self,
+        in_dim,
+        embd_dim,
+        max_seq_len,
+        n_heads,
+        mha_win_size,
+        stride=1,
+        arch=(2, 4, 6),     # (embed convs, MIND iterations, branch transformers)
+        attn_pdrop=0.0,
+        proj_pdrop=0.0,
+        path_pdrop=0.0,
+        use_abs_pe=False,
+        use_conv_swiglu=False,
+        conv_kernel=3,
+        refinement_mode='log_attn',
+        encoder_halting='entropy',  # halting method for encoder (None for no halting)
+        warmup_depth=3,
+    ):
+        super().__init__()
+
+        self.halting = build_halting(encoder_halting)
+
+        assert len(arch) == 3
+        assert stride & (stride - 1) == 0
+        assert arch[0] >= int(math.log2(stride))
+        self.max_seq_len = max_seq_len
+        self.n_stem_iterations = arch[1]
+        self.warmup_depth = warmup_depth
+
+        # === SAME AS ORIGINAL: embedding projection ===
+        self.embd_fc = MaskedConv1D(in_dim, embd_dim, 1)
+
+        # === SAME AS ORIGINAL: embedding convs ===
+        self.embd_convs = nn.ModuleList()
+        self.embd_norms = nn.ModuleList()
+        for _ in range(arch[0]):
+            self.embd_convs.append(
+                MaskedConv1D(
+                    embd_dim, embd_dim,
+                    kernel_size=5 if stride > 1 else 3,
+                    stride=2 if stride > 1 else 1,
+                    padding=2 if stride > 1 else 1,
+                    bias=False
+                )
+            )
+            self.embd_norms.append(LayerNorm(embd_dim))
+            stride = max(stride // 2, 1)
+
+        # === SAME AS ORIGINAL: position encoding ===
+        if use_abs_pe:
+            pe = sinusoid_encoding(max_seq_len, embd_dim // 2)
+            pe /= embd_dim ** 0.5
+            self.register_buffer('pe', pe, persistent=False)
+        else:
+            self.pe = None
+
+        # === CHANGED: stem is now a single MIND block looped N times ===
+        self.stem = MINDEncoderBlock(
+            embd_dim,
+            n_heads=n_heads,
+            stride=1,  # stem is always stride=1
+            window_size=mha_win_size,
+            attn_pdrop=attn_pdrop,
+            proj_pdrop=proj_pdrop,
+            path_pdrop=path_pdrop,
+            use_conv_swiglu=use_conv_swiglu,
+            conv_kernel=conv_kernel,
+            refinement_mode=refinement_mode
+        )
+
+        # === SAME AS ORIGINAL: branch transformers for FPN ===
+        self.branch = nn.ModuleList()
+        for idx in range(arch[2]):
+            self.branch.append(
+                TransformerEncoder(
+                    embd_dim,
+                    stride=2 if idx > 0 else 1,
+                    n_heads=n_heads,
+                    window_size=mha_win_size,
+                    attn_pdrop=attn_pdrop,
+                    proj_pdrop=proj_pdrop,
+                    path_pdrop=path_pdrop,
+                )
+            )
+
+        self.apply(self.__init_weights__)
+
+    def __init_weights__(self, module):
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def forward(self, x, mask):
+        """
+        Args:
+            x (float tensor, (bs, c1, t1)): video features.
+            mask (bool tensor, (bs, t1)): video mask.
+        """
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(1)
+
+        # === SAME: embedding projection ===
+        x, _ = self.embd_fc(x, mask)
+
+        # === SAME: embedding convs ===
+        for conv, norm in zip(self.embd_convs, self.embd_norms):
+            x, mask = conv(x, mask)
+            x = F.relu(norm(x), inplace=True)
+
+        # === SAME: position encoding ===
+        _, _, t = x.size()
+        if self.pe is not None:
+            pe = self.pe.to(x.dtype)
+            if self.training:
+                assert t <= self.max_seq_len
+            else:
+                if t > self.max_seq_len:
+                    pe = F.interpolate(
+                        pe[None], size=t, mode='linear', align_corners=True
+                    )[0]
+            x = x + pe[..., :t] * mask.to(x.dtype)
+
+        # === CHANGED: MIND looped stem with adaptive halting ===
+        halt_at_eval_only = getattr(self, 'halt_at_eval_only', False)
+        use_halting_loop = (self.halting is not None) and (not self.training or not halt_at_eval_only)
+
+        if not use_halting_loop:
+            # original loop — no masking, no overhead, identical gradients
+            prev_attn = None
+            prev_out = None
+
+            # reset learned halting state
+            if self.halting is not None and hasattr(self.halting, 'reset'):
+                self.halting.reset()
+
+            for _ in range(self.n_stem_iterations):
+                x_prev = x
+                x, mask, prev_attn = self.stem(x, mask, prev_out=prev_out, prev_attn=prev_attn)
+                prev_out = x_prev
+            
+            halt_info =  None
+
+        else:
+            # adaptive loop with halting
+            prev_attn = None
+            prev_out = None
+            halted = torch.zeros(x.size(0), dtype=torch.bool, device=x.device)
+            accumulated = torch.zeros_like(x)
+            iters_used = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+            all_halt_probs = []
+
+            halting_active = getattr(self, 'halting_active', True)
+
+            for itr in range(self.n_stem_iterations):
+                active = ~halted
+                if not active.any():
+                    break
+
+                active_idx = active.nonzero(as_tuple=True)[0]
+
+                x_active = x[active_idx]
+                mask_active = mask[:, :, :][active_idx]
+                prev_out_active = prev_out[active_idx] if prev_out is not None else None
+                prev_attn_active = prev_attn[active_idx] if prev_attn is not None else None
+
+                x_prev_active = x_active
+                self._set_stem_dropout(False)
+
+                x_active, mask_active, prev_attn_new = self.stem(
+                    x_active, mask_active,
+                    prev_out=prev_out_active,
+                    prev_attn=prev_attn_active
+                )
+                self._set_stem_dropout(True)
+                x = x.clone()
+                x[active_idx] = x_active
+                
+
+                prev_out = prev_out.clone() if prev_out is not None else torch.zeros_like(x)
+                prev_out[active_idx] = x_prev_active
+
+                if prev_attn is None:
+                    bs = halted.size(0)
+                    prev_attn = prev_attn_new.new_zeros(
+                        bs, *prev_attn_new.shape[1:]
+                    )
+                else:
+                    prev_attn = prev_attn.clone()
+                prev_attn[active_idx] = prev_attn_new
+
+                iters_used[active_idx] += 1
+
+                if not halting_active:
+                    if hasattr(self.halting, 'forward_warmup'):
+                        sample_fn = lambda: self.stem(
+                            x_active, mask_active,
+                            prev_out=prev_out_active,
+                            prev_attn=prev_attn_active
+                        )[0]
+                        self.halting.forward_warmup(
+                            hidden=x_active,
+                            mask=mask_active,
+                            itr=itr,
+                            sample_fn=sample_fn,
+                            attn_weights=prev_attn_new,
+                        )
+                    depth = self.warmup_depth
+                    newly_halted = (iters_used[active_idx] >= depth)
+                else:
+                    sample_fn = lambda: self.stem(
+                        x_active, mask_active,
+                        prev_out=prev_out_active,
+                        prev_attn=prev_attn_active
+                    )[0]
+                    halt_prob = self.halting(
+                        hidden=x_active,
+                        mask=mask_active,
+                        itr=itr,
+                        attn_weights=prev_attn_new,
+                        sample_fn=sample_fn,
+                    )
+                    full_halt_prob = torch.zeros(x.size(0), device=x.device)
+                    full_halt_prob[active_idx] = halt_prob
+                    all_halt_probs.append(full_halt_prob)
+                    newly_halted = halt_prob > 0.5
+
+                    if hasattr(self.halting, '_last_var'):
+                        if not hasattr(self, '_var_log'):
+                            self._var_log = []
+                        self._var_log.append({
+                            'itr': self.halting._last_itr,
+                            'var_mean': self.halting._last_var.mean().item(),
+                            'var_std': self.halting._last_var.std().item(),
+                            'ratio': self.halting._last_var.mean().item() /  max(self.halting.var_iter0.item(), 1e-8),
+                            'thresh': self.halting._last_thresh.item() if torch.is_tensor(self.halting._last_thresh) else self.halting._last_thresh,
+                            'n_halted': (halt_prob > 0.5).sum().item(),
+                            'n_active': active_idx.size(0),
+                        })
+                    
+
+                if itr == self.n_stem_iterations - 1:
+                    newly_halted = torch.ones(active_idx.size(0), dtype=torch.bool, device=x.device)
+
+                halt_indices = active_idx[newly_halted]
+                accumulated[halt_indices] = x[halt_indices]
+                halted[halt_indices] = True
+
+                
+
+            x = accumulated
+            halt_info = {
+                'iters_used': iters_used,
+                'halt_probs': all_halt_probs,
+                'var_log': getattr(self, '_var_log', []),
+            }
+            self._var_log = []  # reset for next forward pass
+
+        # === SAME: branch layers building FPN ===
+        fpn, fpn_masks = tuple(), tuple()
+        for block in self.branch:
+            x, mask = block(x, mask)
+            fpn += (x,)
+            fpn_masks += (mask,)
+
+        if halt_info is not None:
+            return fpn, fpn_masks, halt_info
+        else:
+            return fpn, fpn_masks
+    
+    def _set_stem_dropout(self, enable):
+        for m in self.stem.modules():
+            if isinstance(m, nn.Dropout):
+                if enable:
+                    m.train()
+                else:
+                    m.eval()
+
+@register_video_net('mind_transformer_ponder')
+class MINDVideoTransformer(nn.Module):
+    """
+    Drop-in replacement for VideoTransformer.
+
+    Identical structure:
+        video features
+        -> [embedding convs x L1]       (SAME)
+        -> [stem: MIND looped block]     (CHANGED: weight-tied with refinement)
+        -> [branch transformer x L3]     (SAME: regular TransformerEncoder for FPN)
+        -> latent video feature pyramid
+
+    arch = (n_embd_convs, n_stem_iterations, n_branch_transformers)
+    NOTE: arch[1] now means number of MIND iterations, not number of stem layers.
+    """
+    def __init__(
+        self,
+        in_dim,
+        embd_dim,
+        max_seq_len,
+        n_heads,
+        mha_win_size,
+        stride=1,
+        arch=(2, 4, 6),     # (embed convs, MIND iterations, branch transformers)
+        attn_pdrop=0.0,
+        proj_pdrop=0.0,
+        path_pdrop=0.0,
+        use_abs_pe=False,
+        use_conv_swiglu=False,
+        conv_kernel=3,
+        refinement_mode='log_attn',
+        encoder_halting='entropy',  # halting method for encoder (None for no halting)
+        warmup_depth=3,
+    ):
+        super().__init__()
+
+        self.halting = build_halting(encoder_halting)
+
+        assert len(arch) == 3
+        assert stride & (stride - 1) == 0
+        assert arch[0] >= int(math.log2(stride))
+        self.max_seq_len = max_seq_len
+        self.n_stem_iterations = arch[1]
+        self.warmup_depth = warmup_depth
+
+        # === SAME AS ORIGINAL: embedding projection ===
+        self.embd_fc = MaskedConv1D(in_dim, embd_dim, 1)
+
+        # === SAME AS ORIGINAL: embedding convs ===
+        self.embd_convs = nn.ModuleList()
+        self.embd_norms = nn.ModuleList()
+        for _ in range(arch[0]):
+            self.embd_convs.append(
+                MaskedConv1D(
+                    embd_dim, embd_dim,
+                    kernel_size=5 if stride > 1 else 3,
+                    stride=2 if stride > 1 else 1,
+                    padding=2 if stride > 1 else 1,
+                    bias=False
+                )
+            )
+            self.embd_norms.append(LayerNorm(embd_dim))
+            stride = max(stride // 2, 1)
+
+        # === SAME AS ORIGINAL: position encoding ===
+        if use_abs_pe:
+            pe = sinusoid_encoding(max_seq_len, embd_dim // 2)
+            pe /= embd_dim ** 0.5
+            self.register_buffer('pe', pe, persistent=False)
+        else:
+            self.pe = None
+
+        # === CHANGED: stem is now a single MIND block looped N times ===
+        self.stem = MINDEncoderBlock(
+            embd_dim,
+            n_heads=n_heads,
+            stride=1,  # stem is always stride=1
+            window_size=mha_win_size,
+            attn_pdrop=attn_pdrop,
+            proj_pdrop=proj_pdrop,
+            path_pdrop=path_pdrop,
+            use_conv_swiglu=use_conv_swiglu,
+            conv_kernel=conv_kernel,
+            refinement_mode=refinement_mode
+        )
+
+        # === SAME AS ORIGINAL: branch transformers for FPN ===
+        self.branch = nn.ModuleList()
+        for idx in range(arch[2]):
+            self.branch.append(
+                TransformerEncoder(
+                    embd_dim,
+                    stride=2 if idx > 0 else 1,
+                    n_heads=n_heads,
+                    window_size=mha_win_size,
+                    attn_pdrop=attn_pdrop,
+                    proj_pdrop=proj_pdrop,
+                    path_pdrop=path_pdrop,
+                )
+            )
+
+        self.apply(self.__init_weights__)
+
+    def __init_weights__(self, module):
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def forward(self, x, mask):
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(1)
+
+        # embedding projection
+        x, _ = self.embd_fc(x, mask)
+
+        # embedding convs
+        for conv, norm in zip(self.embd_convs, self.embd_norms):
+            x, mask = conv(x, mask)
+            x = F.relu(norm(x), inplace=True)
+
+        # position encoding
+        _, _, t = x.size()
+        if self.pe is not None:
+            pe = self.pe.to(x.dtype)
+            if self.training:
+                assert t <= self.max_seq_len
+            else:
+                if t > self.max_seq_len:
+                    pe = F.interpolate(
+                        pe[None], size=t, mode='linear', align_corners=True
+                    )[0]
+            x = x + pe[..., :t] * mask.to(x.dtype)
+
+        halt_at_eval_only = getattr(self, 'halt_at_eval_only', False)
+        use_halting_loop = (self.halting is not None) and (not self.training or not halt_at_eval_only)
+
+        if not use_halting_loop:
+            # TRAINING: full depth, collect per-iteration predictions
+            if self.halting is not None and hasattr(self.halting, 'reset'):
+                self.halting.reset()
+
+            prev_attn = None
+            prev_out = None
+            intermediate_fpns = []
+
+            for itr in range(self.n_stem_iterations):
+                x_prev = x
+                x, mask, prev_attn = self.stem(
+                    x, mask, prev_out=prev_out, prev_attn=prev_attn
+                )
+                prev_out = x_prev
+
+                if self.training and self.halting is not None:
+                    if hasattr(self.halting, 'forward_train'):
+                        self.halting.forward_train(hidden=x, mask=mask, itr=itr)
+
+                        # exact PonderNet: run branch at this iteration
+                        fpn_itr, fpn_masks_itr = self._run_branch(x, mask)
+                        intermediate_fpns.append((fpn_itr, fpn_masks_itr))
+
+                    elif hasattr(self.halting, 'forward_warmup'):
+                        sample_fn = lambda: self.stem(
+                            x, mask, prev_out=prev_out, prev_attn=prev_attn
+                        )[0]
+                        self.halting.forward_warmup(
+                            hidden=x, mask=mask, itr=itr, sample_fn=sample_fn
+                        )
+
+            # final FPN from full-depth output
+            fpn, fpn_masks = self._run_branch(x, mask)
+
+            # build halt info
+            halt_info = None
+            if self.halting is not None:
+                halt_info = {
+                    'iters_used': torch.full(
+                        (x.size(0),), self.n_stem_iterations, device=x.device
+                    ),
+                    'halt_probs': [],
+                }
+                if hasattr(self.halting, 'compute_halting_distribution'):
+                    halt_dist = self.halting.compute_halting_distribution()
+                    kl_loss = self.halting.compute_kl_loss()
+                    halt_info['halt_dist'] = halt_dist
+                    halt_info['kl_loss'] = kl_loss
+                    halt_info['intermediate_fpns'] = intermediate_fpns
+                elif hasattr(self.halting, 'compute_loss'):
+                    halt_info['halt_loss'] = self.halting.compute_loss()
+
+            if halt_info is not None:
+                return fpn, fpn_masks, halt_info
+            return fpn, fpn_masks
+
+        else:
+            # EVAL: adaptive loop with hard halting
+            prev_attn = None
+            prev_out = None
+            halted = torch.zeros(x.size(0), dtype=torch.bool, device=x.device)
+            accumulated = torch.zeros_like(x)
+            iters_used = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+            all_halt_probs = []
+
+            halting_active = getattr(self, 'halting_active', True)
+
+            for itr in range(self.n_stem_iterations):
+                active = ~halted
+                if not active.any():
+                    break
+
+                active_idx = active.nonzero(as_tuple=True)[0]
+                x_active = x[active_idx]
+                mask_active = mask[active_idx]
+                prev_out_active = prev_out[active_idx] if prev_out is not None else None
+                prev_attn_active = prev_attn[active_idx] if prev_attn is not None else None
+
+                x_prev_active = x_active
+                x_active, mask_active, prev_attn_new = self.stem(
+                    x_active, mask_active,
+                    prev_out=prev_out_active,
+                    prev_attn=prev_attn_active
+                )
+
+                x = x.clone()
+                x[active_idx] = x_active
+                prev_out = prev_out.clone() if prev_out is not None else torch.zeros_like(x)
+                prev_out[active_idx] = x_prev_active
+                if prev_attn is None:
+                    bs = halted.size(0)
+                    prev_attn = prev_attn_new.new_zeros(bs, *prev_attn_new.shape[1:])
+                else:
+                    prev_attn = prev_attn.clone()
+                prev_attn[active_idx] = prev_attn_new
+
+                iters_used[active_idx] += 1
+
+                halt_prob = self.halting(
+                    hidden=x_active, mask=mask_active, itr=itr
+                )
+
+                full_halt_prob = torch.zeros(x.size(0), device=x.device)
+                full_halt_prob[active_idx] = halt_prob
+                all_halt_probs.append(full_halt_prob)
+                newly_halted = torch.bernoulli(halt_prob).bool()
+
+                if itr == self.n_stem_iterations - 1:
+                    newly_halted = torch.ones(
+                        active_idx.size(0), dtype=torch.bool, device=x.device
+                    )
+
+                halt_indices = active_idx[newly_halted]
+                accumulated[halt_indices] = x[halt_indices]
+                halted[halt_indices] = True
+
+            x = accumulated
+            fpn, fpn_masks = self._run_branch(x, mask)
+
+            return fpn, fpn_masks, {
+                'iters_used': iters_used,
+                'halt_probs': all_halt_probs,
+            }
+
+    def _run_branch(self, x, mask):
+        """Run branch layers to produce FPN. Does not modify input."""
+        fpn, fpn_masks = tuple(), tuple()
+        x_b, m_b = x, mask
+        for block in self.branch:
+            x_b, m_b = block(x_b, m_b)
+            fpn += (x_b,)
+            fpn_masks += (m_b,)
+        return fpn, fpn_masks
+    
+    def _set_stem_dropout(self, enable):
+        for m in self.stem.modules():
+            if isinstance(m, nn.Dropout):
+                if enable:
+                    m.train()
+                else:
+                    m.eval()
+
 
 @register_video_net('mind_transformer_v2')
 class MINDVideoTransformerV2(nn.Module):

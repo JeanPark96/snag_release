@@ -210,6 +210,7 @@ class MINDTextTransformer(nn.Module):
         use_bkgd_token=True,
         use_conv_swiglu=False,
         conv_kernel=3,
+        refinement_mode = "log_attn"  # none | ftheta
     ):
         super().__init__()
 
@@ -247,6 +248,7 @@ class MINDTextTransformer(nn.Module):
             path_pdrop=path_pdrop,
             use_conv_swiglu=use_conv_swiglu,
             conv_kernel=conv_kernel,
+            refinement_mode=refinement_mode
         )
 
         self.apply(self.__init_weights__)
@@ -283,10 +285,12 @@ class MINDTextTransformer(nn.Module):
             mask = torch.cat((mask[..., :1], mask), dim=-1)
 
         # MIND loop
+        prev_out = None
         prev_attn = None
         for _ in range(self.n_iterations):
-            x, mask, prev_attn = self.loop_block(x, mask, prev_attn) #stride 0 does not modify mask
-
+            x_prev = x
+            x, mask, prev_attn = self.loop_block(x, mask, prev_out=prev_out, prev_attn=prev_attn)
+            prev_out = x_prev
         return x, mask
 
 def make_text_net(opt):

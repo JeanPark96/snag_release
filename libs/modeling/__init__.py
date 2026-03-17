@@ -1,3 +1,3 @@
 from .loss import sigmoid_focal_loss, ctr_giou_loss, ctr_diou_loss
-from .model import PtTransformer, PtGenerator, PtTransformerLoop
+from .model import PtTransformer, PtGenerator, PtTransformerACT, PtTransformerACTPonder
 from .optim import make_optimizer, make_scheduler
