@@ -2,16 +2,18 @@ import argparse
 import os
 
 import torch
-from libs import load_opt, Evaluator
+from libs import load_opt
+from libs import Evaluator as Evaluator
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', type=str, help="job name")
     parser.add_argument('--ckpt', type=str, help="checkpoint name")
+    parser.add_argument('--folder', type=str, default="base", help="experiment name")
     args = parser.parse_args()
 
-    root = os.path.join('experiments', args.name)
+    root = os.path.join('experiments', args.folder, args.name)
     try:
         opt = load_opt(os.path.join(root, 'opt.yaml'), is_training=False)
     except:

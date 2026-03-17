@@ -7,7 +7,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 mp.set_sharing_strategy('file_system')
 
-from libs import load_opt, Trainer
+from libs import load_opt
+from libs import Trainer as Trainer
 
 
 def main(rank, opt):
@@ -34,6 +35,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--opt', type=str, help="training options")
     parser.add_argument('--name', type=str, help="job name")
+    parser.add_argument('--folder', type=str, default="base", help="experiment name")
     parser.add_argument('--seed', type=int, default=1234567891, help="overwrite seed")
     args = parser.parse_args()
     torch.backends.cudnn.benchmark = False
@@ -42,7 +44,7 @@ if __name__ == '__main__':
 
     # create experiment folder
     os.makedirs('experiments', exist_ok=True)
-    root = os.path.join('experiments', args.name)
+    root = os.path.join('experiments', args.folder, args.name)
     os.makedirs(root, exist_ok=True)
     try:
         opt = load_opt(os.path.join(root, 'opt.yaml'), is_training=True)
