@@ -129,14 +129,22 @@ class LoopedXAttNFusion(nn.Module):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
-    def _forward(self, q, q_mask, kv, kv_mask, kv_size=None):
+    def _forward(self, q, q_mask, kv, kv_mask, kv_size=None, level_idx=0):
         self._last_attn_weights = []
 
         # iteratively re-attend to text, refining alignment each time
-       
-        for i in range(self.n_iterations):
+        if level_idx == 3:
+            for i in range(self.n_iterations):
+                    q, q_mask = self.decoder(
+                        q, q_mask, kv, kv_mask, kv_size, loop_idx=i
+                    )
+                    self._last_attn_weights.append(
+                        self.decoder._last_attn_weights
+                    )
+        else:
+                # for later FPN levels, just run through the shared decoder once (no loop)
                 q, q_mask = self.decoder(
-                    q, q_mask, kv, kv_mask, kv_size, loop_idx=i
+                    q, q_mask, kv, kv_mask, kv_size, loop_idx=0
                 )
                 self._last_attn_weights.append(
                     self.decoder._last_attn_weights
@@ -155,8 +163,10 @@ class LoopedXAttNFusion(nn.Module):
             return self._forward(vid, vid_masks, text, text_mask, text_size)
 
         out, out_masks = tuple(), tuple()
+        level_idx = 0
         for x, mask in zip(vid, vid_masks):
-            x, mask = self._forward(x, mask, text, text_mask, text_size)
+            level_idx += 1
+            x, mask = self._forward(x, mask, text, text_mask, text_size, level_idx)
             out += (x,)
             out_masks += (mask,)
 

@@ -1,6 +1,8 @@
 from .halt_methods import build_halting
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from .level_gating import LevelGatingNetwork
 
 from .blocks import MaskedConv1D
 from .fusion import make_fusion
@@ -39,6 +41,8 @@ class PtTransformer(nn.Module):
 
         fpn_logits, _ = self.cls_head(fpn, fpn_masks)
         fpn_offsets, fpn_masks = self.reg_head(fpn, fpn_masks)
+
+        
 
         # ---- diagnostic: per-level prediction analysis ----
         # if not self.training:
@@ -87,6 +91,201 @@ class PtTransformer(nn.Module):
             self.fuse_and_predict(fpn, fpn_masks, text, text_masks, text_size)
 
         return fpn_logits, fpn_offsets, fpn_masks
+
+
+class PtTransformerGate(nn.Module):
+    """
+    Transformer based model for single-stage sentence grounding
+    """
+    def __init__(self, opt):
+        super().__init__()
+
+        # backbones
+        self.text_net = make_text_net(opt['text_net'])
+        self.vid_net = make_video_net(opt['vid_net'])
+
+        # fusion and prediction heads
+        self.fusion = make_fusion(opt['fusion'])
+        self.cls_head = make_head(opt['cls_head'])
+        self.reg_head = make_head(opt['reg_head'])
+
+        self.hard_coded = False
+
+        # --- level gating (Method B) ---
+        gate_opt = opt.get('level_gate', None)
+        if gate_opt is not None and gate_opt.get('enabled', False):
+            self.level_gate = LevelGatingNetwork(
+                num_levels=opt['vid_net']['arch'][-1],
+                fpn_dim=opt['vid_net']['embd_dim'],
+                text_dim=opt['text_net']['embd_dim'],
+                hidden_dim=gate_opt.get('hidden_dim', 128),
+                init_bias=gate_opt.get('init_bias', 2.0),
+                tau=gate_opt.get('tau_init', 2.0),
+                tau_min=gate_opt.get('tau_min', 0.5),
+            )
+        else:
+            self.level_gate = None
+
+    def encode_text(self, tokens, token_masks):
+        text, text_masks = self.text_net(tokens, token_masks)
+        return text, text_masks
+
+    def encode_video(self, vid, vid_masks):
+        fpn, fpn_masks = self.vid_net(vid, vid_masks)
+        return fpn, fpn_masks
+
+    def fuse_and_predict(self, fpn, fpn_masks, text, text_masks, text_size=None):
+        
+        if self.hard_coded:
+            active_levels = [2, 3, 4]  # hardcoded for validation
+        
+            # Only fuse active levels
+            active_fpn = tuple(fpn[l] for l in active_levels)
+            active_masks = tuple(fpn_masks[l] for l in active_levels)
+            
+            fused, fused_masks = self.fusion(
+                active_fpn, active_masks, text, text_masks, text_size
+            )
+            self._last_fused_fpn = fpn 
+            fused_logits, _ = self.cls_head(fused, fused_masks)
+            fused_offsets, fused_out_masks = self.reg_head(fused, fused_masks)
+            
+            # Use the actual (expanded) batch size from fused outputs
+            bs = fused_logits[0].size(0)
+            device = fused_logits[0].device
+
+            all_logits, all_offsets, all_masks = tuple(), tuple(), tuple()
+            active_idx = 0
+            for l in range(len(fpn)):
+                if l in active_levels:
+                    all_logits += (fused_logits[active_idx],)
+                    all_offsets += (fused_offsets[active_idx],)
+                    all_masks += (fused_out_masks[active_idx],)
+                    active_idx += 1
+                else:
+                    # p = number of temporal positions at this FPN level
+                    # fpn_masks[l] is (bs_original, 1, p) — get p from it
+                    p = fpn_masks[l].size(-1)
+                    all_logits += (torch.full((bs, p), -1e4, device=device),)
+                    all_offsets += (torch.zeros(bs, p, 2, device=device),)
+                    all_masks += (torch.zeros(bs, p, dtype=torch.bool, device=device),)
+
+            return all_logits, all_offsets, all_masks
+        else:
+            if self.level_gate is not None:
+                gates = self.level_gate(
+                    fpn, fpn_masks, text, text_masks, text_size
+                )
+            else:
+                gates = None
+    
+            # --- fuse all levels (needed for differentiability during training) ---
+            fused_fpn, fused_masks = self.fusion(
+                fpn, fpn_masks, text, text_masks, text_size
+            )
+            self._last_fused_fpn = fpn 
+            # --- apply soft gates to fused features ---
+            if gates is not None:
+                gated_fpn = tuple()
+                for l, f in enumerate(fused_fpn):
+                    g = gates[:, l].unsqueeze(1).unsqueeze(2)   # (bs, 1, 1)
+                    gated_fpn += (f * g,)
+            else:
+                gated_fpn = fused_fpn
+    
+            # --- predict ---
+            fpn_logits, _ = self.cls_head(gated_fpn, fused_masks)
+            fpn_offsets, fpn_masks_out = self.reg_head(gated_fpn, fused_masks)
+    
+            # detached so gradient flows only through feature scaling, not this mask
+            # --- mask logits for gated-out levels (INFERENCE ONLY) ---
+            if gates is not None and not self.training:
+                masked_logits = tuple()
+                for l, logits_l in enumerate(fpn_logits):
+                    penalty = (1.0 - gates[:, l]).unsqueeze(1) * (-1e4)
+                    masked_logits += (logits_l + penalty,)
+                fpn_logits = masked_logits
+    
+            return fpn_logits, fpn_offsets, fpn_masks_out, gates
+
+    def forward(self, vid, vid_masks, text, text_masks, text_size=None):
+        # pack text features
+        if text.ndim == 4:
+            text = torch.cat([t[:k] for t, k in zip(text, text_size)])
+        if text_masks.ndim == 3:
+            text_masks = torch.cat(
+                [t[:k] for t, k in zip(text_masks, text_size)]
+            )
+        
+        text, text_masks = self.encode_text(text, text_masks)
+        fpn, fpn_masks = self.encode_video(vid, vid_masks)
+        fpn_logits, fpn_offsets, fpn_masks, gates = \
+            self.fuse_and_predict(fpn, fpn_masks, text, text_masks, text_size)
+
+        return fpn_logits, fpn_offsets, fpn_masks, gates
+
+class CrossLevelContext(nn.Module):
+    """
+    Learns to select which coarse level provides the best
+    spatial prior for fine levels, then projects that context
+    into a form fine levels can use.
+    """
+    def __init__(self, embd_dim, n_source_levels=4, n_target_levels=3):
+        super().__init__()
+        # soft attention over source levels
+        # input: pooled feature per source level → weight per source
+        self.source_gate = nn.Sequential(
+            nn.Linear(embd_dim * n_source_levels, n_source_levels),
+            nn.Softmax(dim=-1)
+        )
+        # project cross-level context into target feature space
+        self.context_proj = nn.Conv1d(embd_dim, embd_dim, 1)
+
+        # initialize near zero so iteration 0 = baseline
+        nn.init.zeros_(self.context_proj.weight)
+        nn.init.zeros_(self.context_proj.bias)
+
+    def forward(self, fused_fpn, fpn_masks):
+        B, C = fused_fpn[0].shape[0], fused_fpn[0].shape[1]
+
+        # Step 1: per-source-level summary
+        source_summaries = []
+        for l in [2, 3, 4, 5]:
+            feat = fused_fpn[l]                              # (B, 256, T_l)
+            mask = fpn_masks[l].float()                       # (B, 1, T_l) — already has channel dim
+            pooled = (feat * mask).sum(dim=2) / (mask.sum(dim=2) + 1e-8)  # (B, 256)
+            source_summaries.append(pooled)
+
+        # Step 2: soft attention to select source
+        gate_input = torch.cat(source_summaries, dim=-1)      # (B, 1024)
+        gate_weights = self.source_gate(gate_input)            # (B, 4)
+
+        # Step 3: weighted combination upsampled to finest resolution
+        T_finest = fused_fpn[0].shape[2]
+        combined_context = torch.zeros(B, C, T_finest,
+                                    device=fused_fpn[0].device)
+        for i, l in enumerate([2, 3, 4, 5]):
+            upsampled = F.interpolate(
+                fused_fpn[l].detach(), size=T_finest,
+                mode='nearest'
+            )
+            combined_context += gate_weights[:, i:i+1, None] * upsampled
+
+        # Step 4: project
+        projected = self.context_proj(combined_context)
+
+        # Step 5: inject into fine levels
+        enriched = list(fused_fpn)
+        for l in [0, 1, 2]:
+            T_l = fused_fpn[l].shape[2]
+            if T_l != T_finest:
+                ctx_l = F.interpolate(projected, size=T_l,
+                                    mode='nearest')
+            else:
+                ctx_l = projected
+            enriched[l] = fused_fpn[l] + ctx_l
+
+        return tuple(enriched)
 
 class PtTransformerACT(nn.Module):
     """

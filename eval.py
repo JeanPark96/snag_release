@@ -3,7 +3,7 @@ import os
 
 import torch
 from libs import load_opt
-from libs import Evaluator as Evaluator
+from libs import EvaluatorDecGate as Evaluator
 
 
 if __name__ == '__main__':

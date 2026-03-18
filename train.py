@@ -8,7 +8,7 @@ import torch.multiprocessing as mp
 mp.set_sharing_strategy('file_system')
 
 from libs import load_opt
-from libs import Trainer as Trainer
+from libs import TrainerDecGate as Trainer
 
 
 def main(rank, opt):
