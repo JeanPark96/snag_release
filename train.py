@@ -8,7 +8,7 @@ import torch.multiprocessing as mp
 mp.set_sharing_strategy('file_system')
 
 from libs import load_opt
-from libs import TrainerDecGate as Trainer
+from libs import TrainerWithVal as Trainer
 
 
 def main(rank, opt):
@@ -41,10 +41,10 @@ if __name__ == '__main__':
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.enabled = False
-
+    experiment_folder_name = "experiments_train_val_split"
     # create experiment folder
-    os.makedirs('experiments', exist_ok=True)
-    root = os.path.join('experiments', args.folder, args.name)
+    os.makedirs(experiment_folder_name, exist_ok=True)
+    root = os.path.join(experiment_folder_name, args.folder, args.name)
     os.makedirs(root, exist_ok=True)
     try:
         opt = load_opt(os.path.join(root, 'opt.yaml'), is_training=True)

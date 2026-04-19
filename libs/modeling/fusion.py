@@ -29,6 +29,7 @@ class XAttNFusion(nn.Module):
         proj_pdrop=0.0,     # dropout rate for projection
         path_pdrop=0.0,     # dropout rate for residual paths
         xattn_mode='adaln', # cross-attention mode (adaln | affine)
+        return_features=True,  # whether to return intermediate features for analysis
     ):
         super(XAttNFusion, self).__init__()
 
@@ -51,35 +52,140 @@ class XAttNFusion(nn.Module):
 
         self._last_attn_weights = []
 
+        self.return_features = return_features
+
     def __init_weights__(self, module):
         if isinstance(module, (nn.Linear, nn.Conv1d)):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
     def _forward(self, q, q_mask, kv, kv_mask, kv_size=None):
-        for layer in self.layers:
+        features = {} if self.return_features else None
+        for idx, layer in enumerate(self.layers):
             q, q_mask = layer(q, q_mask, kv, kv_mask, kv_size)
+            if self.return_features:
+                features[f"fusion_layer_{idx+1}_q"] = q
+                features[f"fusion_layer_{idx+1}_q_mask"] = q_mask
             self._last_attn_weights.append(layer._last_attn_weights)
         q = self.ln_out(q)
+
+        if self.return_features:
+                features["fusion_ln_out_q"] = q
+                features["fusion_ln_out_q_mask"] = q_mask
 
         # repeat query to match the size of key / value
         if kv_size is not None and q.size(0) != kv.size(0):
             q = q.repeat_interleave(kv_size, dim=0)
             q_mask = q_mask.repeat_interleave(kv_size, dim=0)
+            if self.return_features:
+                features["fusion_repeated_q"] = q
+                features["fusion_repeated_q_mask"] = q_mask
 
-        return q, q_mask
+        return q, q_mask, features
 
     def forward(self, vid, vid_masks, text, text_mask, text_size=None):
         if not isinstance(vid, tuple):
             return self._forward(vid, vid_masks, text, text_mask, text_size)
-            
+        
+        all_features = {} if self.return_features else None
+        idx = 0
         out, out_masks = tuple(), tuple()
         for x, mask in zip(vid, vid_masks):
-            x, mask = self._forward(x, mask, text, text_mask, text_size)
+            x, mask, features = self._forward(x, mask, text, text_mask, text_size)
             out += (x, )
             out_masks += (mask, )
+            idx+= 1
+            if self.return_features:
+                all_features[f"fusion_pyramid_{idx}"] = features
 
-        return out, out_masks
+        return out, out_masks, all_features
+
+
+@register_fusion('xattn_level')
+class XAttNFusion(nn.Module):
+    def __init__(
+        self,
+        vid_dim,
+        text_dim,
+        n_layers=2,
+        n_heads=4,
+        attn_pdrop=0.0,
+        proj_pdrop=0.0,
+        path_pdrop=0.0,
+        xattn_mode='adaln',
+        return_features=True,
+        branch_depths=None,  # e.g. [2, 2, 3, 3, 4, 4]
+    ):
+        super(XAttNFusion, self).__init__()
+
+        self.branch_depths = branch_depths
+        self.n_layers = n_layers
+
+        self.layers = nn.ModuleList()
+        for _ in range(n_layers):
+            self.layers.append(
+                TransformerDecoder(
+                    vid_dim, text_dim,
+                    n_heads=n_heads,
+                    attn_pdrop=attn_pdrop,
+                    proj_pdrop=proj_pdrop,
+                    path_pdrop=path_pdrop,
+                    xattn_mode=xattn_mode,
+                )
+            )
+
+        self.ln_out = LayerNorm(vid_dim)
+        self.apply(self.__init_weights__)
+        self._last_attn_weights = []
+        self.return_features = return_features
+
+    def __init_weights__(self, module):
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def _forward(self, q, q_mask, kv, kv_mask, kv_size=None, depth=None):
+        if depth is None:
+            depth = self.n_layers
+        
+        features = {} if self.return_features else None
+        for idx, layer in enumerate(self.layers[:depth]):
+            q, q_mask = layer(q, q_mask, kv, kv_mask, kv_size)
+            if self.return_features:
+                features[f"fusion_layer_{idx+1}_q"] = q
+                features[f"fusion_layer_{idx+1}_q_mask"] = q_mask
+            self._last_attn_weights.append(layer._last_attn_weights)
+        q = self.ln_out(q)
+
+        if self.return_features:
+            features["fusion_ln_out_q"] = q
+            features["fusion_ln_out_q_mask"] = q_mask
+
+        if kv_size is not None and q.size(0) != kv.size(0):
+            q = q.repeat_interleave(kv_size, dim=0)
+            q_mask = q_mask.repeat_interleave(kv_size, dim=0)
+            if self.return_features:
+                features["fusion_repeated_q"] = q
+                features["fusion_repeated_q_mask"] = q_mask
+
+        return q, q_mask, features
+
+    def forward(self, vid, vid_masks, text, text_mask, text_size=None):
+        if not isinstance(vid, tuple):
+            depth = self.branch_depths[0] if self.branch_depths is not None else None
+            return self._forward(vid, vid_masks, text, text_mask, text_size, depth=depth)
+
+        all_features = {} if self.return_features else None
+        out, out_masks = tuple(), tuple()
+        for idx, (x, mask) in enumerate(zip(vid, vid_masks)):
+            depth = self.branch_depths[idx] if self.branch_depths is not None else None
+            x, mask, features = self._forward(x, mask, text, text_mask, text_size, depth=depth)
+            out += (x,)
+            out_masks += (mask,)
+            if self.return_features:
+                all_features[f"fusion_pyramid_{idx+1}"] = features
+
+        return out, out_masks, all_features
     
 @register_fusion('looped_xattn')
 class LoopedXAttNFusion(nn.Module):

@@ -2,10 +2,13 @@
 
 MAX_RETRIES=5
  
-names=(charades_sta_i3d_default
-        charades_sta_i3d_dec1 
-        charades_sta_i3d_dec3 
-        charades_sta_i3d_dec4 
+names=(
+        # charades_sta_i3d_default
+        # charades_sta_i3d_dec1 
+        # charades_sta_i3d_dec3 
+        # charades_sta_i3d_dec4
+        charades_sta_i3d_dec5 
+        charades_sta_i3d_dec6 
         charades_sta_i3d_enc2 
         charades_sta_i3d_enc3
         charades_sta_i3d_enc4
@@ -27,7 +30,7 @@ for seed in "${seeds[@]}"; do
     success=0
     for i in $(seq 1 "$MAX_RETRIES"); do
       echo "=== seed=$seed name=$name Attempt $i/$MAX_RETRIES ==="
-      if python ./train.py --seed "$seed" --opt "fixed_depth/${name}.yaml" --folder fixed_depth --name "${name}_${seed}"; then
+      if python ./train.py --seed "$seed" --opt "fixed_depth_split/${name}.yaml" --folder fixed_depth_split --name "${name}_${seed}"; then
         success=1
         break
       fi
@@ -40,13 +43,13 @@ for seed in "${seeds[@]}"; do
       exit 1   # or: continue
     fi
 
-    eval_csv="./experiments/fixed_depth/${name}_${seed}/per_sample_eval_last.csv"
+    eval_csv="./experiments_train_val_split/fixed_depth_split/${name}_${seed}/per_sample_eval_last.csv"
 
     if [[ -f "$eval_csv" ]]; then
       echo "Skipping eval: found $eval_csv"
     else
       echo "Running eval: $eval_csv not found"
-      python ./eval.py --name "${name}_${seed}" --ckpt last --folder fixed_depth
+      python ./eval.py --name "${name}_${seed}" --ckpt best --folder fixed_depth_split
     fi
 
   done

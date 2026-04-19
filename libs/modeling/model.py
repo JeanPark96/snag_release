@@ -15,7 +15,7 @@ class PtTransformer(nn.Module):
     """
     Transformer based model for single-stage sentence grounding
     """
-    def __init__(self, opt):
+    def __init__(self, opt, return_features=False):
         super().__init__()
 
         # backbones
@@ -26,6 +26,7 @@ class PtTransformer(nn.Module):
         self.fusion = make_fusion(opt['fusion'])
         self.cls_head = make_head(opt['cls_head'])
         self.reg_head = make_head(opt['reg_head'])
+        self.return_features = return_features
 
     def encode_text(self, tokens, token_masks):
         text, text_masks = self.text_net(tokens, token_masks)
@@ -36,13 +37,27 @@ class PtTransformer(nn.Module):
         return fpn, fpn_masks
 
     def fuse_and_predict(self, fpn, fpn_masks, text, text_masks, text_size=None):
-        fpn, fpn_masks = self.fusion(fpn, fpn_masks, text, text_masks, text_size)
+
+        features = {}
+
+        if self.return_features:
+            features["video_encoder"] = fpn
+            features["video_masks"] = fpn_masks
+            features["text_encoder"] = text
+            features["text_masks"] = text_masks
+            
+        fpn, fpn_masks, feat_dict = self.fusion(fpn, fpn_masks, text, text_masks, text_size)
         self._last_fused_fpn = fpn          # <-- ADD THIS LINE
+        if self.return_features:
+            features["fused_fpn"] = fpn
+            features["fused_masks"] = fpn_masks
 
         fpn_logits, _ = self.cls_head(fpn, fpn_masks)
         fpn_offsets, fpn_masks = self.reg_head(fpn, fpn_masks)
-
-        
+        if self.return_features:
+            features["cls_logits"] = fpn_logits
+            features["reg_offsets"] = fpn_offsets
+            features["reg_masks"] = fpn_masks
 
         # ---- diagnostic: per-level prediction analysis ----
         # if not self.training:
@@ -72,9 +87,11 @@ class PtTransformer(nn.Module):
         #             f"reg  mean={vo.abs().mean():.4f} std={vo.std():.4f} | "
         #             f"feat_norm  mean={vn.mean():.2f} std={vn.std():.2f}")
         #     print("=" * 80)
-
+        if self.return_features:
+            features.update(feat_dict)
+            return fpn_logits, fpn_offsets, fpn_masks, features
    
-        return fpn_logits, fpn_offsets, fpn_masks
+        return fpn_logits, fpn_offsets, fpn_masks, None
 
     def forward(self, vid, vid_masks, text, text_masks, text_size=None):
         # pack text features
@@ -84,13 +101,25 @@ class PtTransformer(nn.Module):
             text_masks = torch.cat(
                 [t[:k] for t, k in zip(text_masks, text_size)]
             )
+        features = {}
         
         text, text_masks = self.encode_text(text, text_masks)
+        if self.return_features:
+            features["text_encoder"] = text
+            features["text_masks"] = text_masks
+
         fpn, fpn_masks = self.encode_video(vid, vid_masks)
-        fpn_logits, fpn_offsets, fpn_masks = \
+        if self.return_features:
+            features["video_encoder"] = fpn
+            features["video_masks"] = fpn_masks
+        
+        fpn_logits, fpn_offsets, fpn_masks, feat_dict = \
             self.fuse_and_predict(fpn, fpn_masks, text, text_masks, text_size)
 
-        return fpn_logits, fpn_offsets, fpn_masks
+        if self.return_features:
+            features.update(feat_dict)
+            return fpn_logits, fpn_offsets, fpn_masks, features
+        return fpn_logits, fpn_offsets, fpn_masks, None
 
 
 class PtTransformerGate(nn.Module):
@@ -99,115 +128,191 @@ class PtTransformerGate(nn.Module):
     """
     def __init__(self, opt):
         super().__init__()
-
+ 
         # backbones
         self.text_net = make_text_net(opt['text_net'])
         self.vid_net = make_video_net(opt['vid_net'])
-
+ 
         # fusion and prediction heads
         self.fusion = make_fusion(opt['fusion'])
         self.cls_head = make_head(opt['cls_head'])
         self.reg_head = make_head(opt['reg_head'])
-
-        self.hard_coded = False
-
+ 
+        self.num_fpn_levels = opt['vid_net']['arch'][-1]
+ 
         # --- level gating (Method B) ---
         gate_opt = opt.get('level_gate', None)
         if gate_opt is not None and gate_opt.get('enabled', False):
             self.level_gate = LevelGatingNetwork(
-                num_levels=opt['vid_net']['arch'][-1],
+                num_levels=self.num_fpn_levels,
                 fpn_dim=opt['vid_net']['embd_dim'],
                 text_dim=opt['text_net']['embd_dim'],
                 hidden_dim=gate_opt.get('hidden_dim', 128),
-                init_bias=gate_opt.get('init_bias', 2.0),
+                init_bias=gate_opt.get('init_bias', 0.0),
                 tau=gate_opt.get('tau_init', 2.0),
                 tau_min=gate_opt.get('tau_min', 0.5),
             )
         else:
             self.level_gate = None
-
+ 
     def encode_text(self, tokens, token_masks):
         text, text_masks = self.text_net(tokens, token_masks)
         return text, text_masks
-
+ 
     def encode_video(self, vid, vid_masks):
         fpn, fpn_masks = self.vid_net(vid, vid_masks)
         return fpn, fpn_masks
-
+ 
     def fuse_and_predict(self, fpn, fpn_masks, text, text_masks, text_size=None):
-        
-        if self.hard_coded:
-            active_levels = [2, 3, 4]  # hardcoded for validation
-        
-            # Only fuse active levels
-            active_fpn = tuple(fpn[l] for l in active_levels)
-            active_masks = tuple(fpn_masks[l] for l in active_levels)
-            
-            fused, fused_masks = self.fusion(
-                active_fpn, active_masks, text, text_masks, text_size
-            )
-            self._last_fused_fpn = fpn 
-            fused_logits, _ = self.cls_head(fused, fused_masks)
-            fused_offsets, fused_out_masks = self.reg_head(fused, fused_masks)
-            
-            # Use the actual (expanded) batch size from fused outputs
-            bs = fused_logits[0].size(0)
-            device = fused_logits[0].device
-
-            all_logits, all_offsets, all_masks = tuple(), tuple(), tuple()
-            active_idx = 0
-            for l in range(len(fpn)):
-                if l in active_levels:
-                    all_logits += (fused_logits[active_idx],)
-                    all_offsets += (fused_offsets[active_idx],)
-                    all_masks += (fused_out_masks[active_idx],)
-                    active_idx += 1
-                else:
-                    # p = number of temporal positions at this FPN level
-                    # fpn_masks[l] is (bs_original, 1, p) — get p from it
-                    p = fpn_masks[l].size(-1)
-                    all_logits += (torch.full((bs, p), -1e4, device=device),)
-                    all_offsets += (torch.zeros(bs, p, 2, device=device),)
-                    all_masks += (torch.zeros(bs, p, dtype=torch.bool, device=device),)
-
-            return all_logits, all_offsets, all_masks
-        else:
-            if self.level_gate is not None:
-                gates = self.level_gate(
-                    fpn, fpn_masks, text, text_masks, text_size
-                )
-            else:
-                gates = None
-    
-            # --- fuse all levels (needed for differentiability during training) ---
-            fused_fpn, fused_masks = self.fusion(
+        if self.level_gate is None:
+            # --- baseline path (no gating) ---
+            fpn, fpn_masks = self.fusion(
                 fpn, fpn_masks, text, text_masks, text_size
             )
-            self._last_fused_fpn = fpn 
-            # --- apply soft gates to fused features ---
-            if gates is not None:
-                gated_fpn = tuple()
-                for l, f in enumerate(fused_fpn):
-                    g = gates[:, l].unsqueeze(1).unsqueeze(2)   # (bs, 1, 1)
-                    gated_fpn += (f * g,)
-            else:
-                gated_fpn = fused_fpn
-    
-            # --- predict ---
-            fpn_logits, _ = self.cls_head(gated_fpn, fused_masks)
-            fpn_offsets, fpn_masks_out = self.reg_head(gated_fpn, fused_masks)
-    
-            # detached so gradient flows only through feature scaling, not this mask
-            # --- mask logits for gated-out levels (INFERENCE ONLY) ---
-            if gates is not None and not self.training:
-                masked_logits = tuple()
-                for l, logits_l in enumerate(fpn_logits):
-                    penalty = (1.0 - gates[:, l]).unsqueeze(1) * (-1e4)
-                    masked_logits += (logits_l + penalty,)
-                fpn_logits = masked_logits
-    
-            return fpn_logits, fpn_offsets, fpn_masks_out, gates
 
+            fpn_logits, _ = self.cls_head(fpn, fpn_masks)
+            fpn_offsets, fpn_masks = self.reg_head(fpn, fpn_masks)
+            return fpn_logits, fpn_offsets, fpn_masks, None, None
+ 
+        # --- Stage 1: compute gates from encoder features BEFORE fusion ---
+        # z = stopgrad([h_0, ..., h_5, h_text])
+        gates, soft_gates = self.level_gate(
+            fpn, fpn_masks, text, text_masks, text_size
+        )   # (bs_query, L)
+ 
+        if self.training:
+            return self._gated_forward_train(
+                fpn, fpn_masks, text, text_masks, text_size, gates, soft_gates
+            )
+        else:
+            return self._gated_forward_eval(
+                fpn, fpn_masks, text, text_masks, gates, soft_gates
+            )
+ 
+    def _gated_forward_train(
+        self, fpn, fpn_masks, text, text_masks, text_size, gates, soft_gates=None
+    ):
+        """
+        Training: soft gates.
+        Stage 3 (soft version):
+            fused_l = g_l · Fusion(fpn_l, text; W_fusion)
+            c_l = ClsHead(fused_l)
+            r_l = RegHead(fused_l)
+ 
+        Gradient: ∂L/∂W_fusion = Σ_l g_l · ∂L_l/∂W_fusion
+        When g_l → 0: that level's gradient contribution → 0.
+        """
+        # --- run fusion on ALL levels ---
+        fused, fused_masks = self.fusion(
+            fpn, fpn_masks, text, text_masks, text_size
+        )
+        self._last_fused_fpn = fpn
+        # fused: tuple of (bs_query, C, T_l) after repeat_interleave
+ 
+        # --- scale fusion output by g_l per level ---
+        # fused_l = g_l · Fusion(fpn_l, text; W_fusion)
+        gated_fused = tuple()
+        for l, f in enumerate(fused):
+            g = gates[:, l].view(-1, 1, 1)              # (bs_q, 1, 1)
+            gated_fused += (f * g,)
+ 
+        # --- prediction heads on gated features ---
+        fpn_logits, _ = self.cls_head(gated_fused, fused_masks)
+        fpn_offsets, fpn_masks_out = self.reg_head(gated_fused, fused_masks)
+ 
+        return fpn_logits, fpn_offsets, fpn_masks_out, gates, soft_gates
+ 
+    def _gated_forward_eval(
+        self, fpn, fpn_masks, text, text_masks, gates, soft_gates=None
+    ):
+        """
+        Inference: hard gates.
+        Stage 3 (hard version):
+            Only run Fusion, ClsHead, RegHead for levels where g_l = 1.
+            Gated-out levels are fully skipped — no computation at all.
+        """
+        # gates: (bs, L) with hard 0/1 values. bs=1 at eval.
+        active = [l for l in range(self.num_fpn_levels) if gates[0, l] > 0.5]
+ 
+        # safety: if all levels gated out, keep the last one
+        if len(active) == 0:
+            active = [self.num_fpn_levels - 1]
+ 
+        # --- only fuse active levels ---
+        active_fpn = tuple(fpn[l] for l in active)
+        active_masks = tuple(fpn_masks[l] for l in active)
+ 
+        fused_active, fused_masks_active = self.fusion(
+            active_fpn, active_masks, text, text_masks
+        )
+        # reconstruct full L-level fused tuple for diagnostic access
+        full_fused = [None] * self.num_fpn_levels
+        ai = 0
+        for l in range(self.num_fpn_levels):
+            if l in active:
+                full_fused[l] = fused_active[ai]
+                ai += 1
+            else:
+                # zero-filled placeholder matching expected shape
+                # use fpn[l] shape: (bs, C, T_l)
+                full_fused[l] = torch.zeros_like(fpn[l])
+        self._last_fused_fpn = tuple(full_fused)
+ 
+        # --- cls head on active levels (no per-level indexing issue) ---
+        active_logits, _ = self.cls_head(fused_active, fused_masks_active)
+ 
+        # --- reg head on active levels with CORRECT Scale[l] indices ---
+        active_offsets, active_out_masks = self._reg_head_selective(
+            fused_active, fused_masks_active, active
+        )
+ 
+        # --- reconstruct full L-level tuples ---
+        device = fpn[0].device
+        bs = gates.size(0)  # 1 at eval
+ 
+        all_logits = [None] * self.num_fpn_levels
+        all_offsets = [None] * self.num_fpn_levels
+        all_masks = [None] * self.num_fpn_levels
+ 
+        ai = 0
+        for l in range(self.num_fpn_levels):
+            if l in active:
+                all_logits[l] = active_logits[ai]
+                all_offsets[l] = active_offsets[ai]
+                all_masks[l] = active_out_masks[ai]
+                ai += 1
+            else:
+                # gated out: -inf logits, zero offsets, original mask shape
+                p = fpn_masks[l].size(-1)
+                all_logits[l] = torch.full(
+                    (bs, p), -1e4, device=device, dtype=fpn[0].dtype
+                )
+                all_offsets[l] = torch.zeros(
+                    bs, p, 2, device=device, dtype=fpn[0].dtype
+                )
+                all_masks[l] = fpn_masks[l].squeeze(1)
+ 
+        return tuple(all_logits), tuple(all_offsets), tuple(all_masks), gates, soft_gates
+ 
+    def _reg_head_selective(self, fpn, fpn_masks, level_indices):
+        """
+        Run RegHead on a subset of levels, using the correct
+        self.reg_head.scales[l] for each actual level index.
+        """
+        out_offsets, out_masks = tuple(), tuple()
+        for i, l in enumerate(level_indices):
+            x, mask = fpn[i], fpn_masks[i]
+            for conv, norm in zip(self.reg_head.convs, self.reg_head.norms):
+                x, _ = conv(x, mask)
+                x = F.relu(norm(x), inplace=True)
+            offsets, _ = self.reg_head.reg_head(x, mask)
+            offsets = F.relu(self.reg_head.scales[l](offsets))  # scales[l]
+            offsets = offsets.transpose(1, 2)
+            mask = mask.squeeze(1)
+            out_offsets += (offsets,)
+            out_masks += (mask,)
+        return out_offsets, out_masks
+ 
     def forward(self, vid, vid_masks, text, text_masks, text_size=None):
         # pack text features
         if text.ndim == 4:
@@ -216,13 +321,13 @@ class PtTransformerGate(nn.Module):
             text_masks = torch.cat(
                 [t[:k] for t, k in zip(text_masks, text_size)]
             )
-        
+ 
         text, text_masks = self.encode_text(text, text_masks)
         fpn, fpn_masks = self.encode_video(vid, vid_masks)
-        fpn_logits, fpn_offsets, fpn_masks, gates = \
+        fpn_logits, fpn_offsets, fpn_masks, gates, soft_gates = \
             self.fuse_and_predict(fpn, fpn_masks, text, text_masks, text_size)
-
-        return fpn_logits, fpn_offsets, fpn_masks, gates
+ 
+        return fpn_logits, fpn_offsets, fpn_masks, gates, soft_gates
 
 class CrossLevelContext(nn.Module):
     """

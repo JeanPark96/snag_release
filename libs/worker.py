@@ -1339,7 +1339,7 @@ class Trainer:
 
         # set up distributed training
         if opt['_distributed']:
-            self.model = DistributedDataParallel(self.model, [get_rank()], find_unused_parameters=True)
+            self.model = DistributedDataParallel(self.model, [get_rank()], find_unused_parameters=False)
             self._ema_init()
 
         # register model hyperparameters
@@ -1429,11 +1429,11 @@ class Trainer:
         
         # forward pass
         if is_last or not self.opt['_distributed']:
-            fpn_logits, fpn_offsets, fpn_masks = \
+            fpn_logits, fpn_offsets, fpn_masks, _ = \
                 self.model(vid, vid_masks, text, text_masks, text_size)
         else:
             with self.model.no_sync():
-                fpn_logits, fpn_offsets, fpn_masks = \
+                fpn_logits, fpn_offsets, fpn_masks, _ = \
                     self.model(vid, vid_masks, text, text_masks, text_size)
         fpn_n_points = [m.size(-1) for m in fpn_masks]
         fpn_points = self.pt_gen(fpn_n_points)
@@ -1752,7 +1752,7 @@ class TrainerDecGate:
 
         # set up distributed training
         if opt['_distributed']:
-            self.model = DistributedDataParallel(self.model, [get_rank()], find_unused_parameters=self.use_level_gate)
+            self.model = DistributedDataParallel(self.model, [get_rank()], find_unused_parameters=False)
             self._ema_init()
 
         # register model hyperparameters
@@ -1771,17 +1771,29 @@ class TrainerDecGate:
         self.loss_weight = opt['train'].get('loss_weight', 1.0)
         self.reg_loss = opt['train'].get('reg_loss', 'diou')
 
-        # --- level gating ---
+        # --- level gating (Method B) ---
         gate_opt = opt['model'].get('level_gate', {})
         self.use_level_gate = gate_opt.get('enabled', False)
-        self.lambda_compute = gate_opt.get('lambda_compute', 0.1)
+        self.lambda_compute = gate_opt.get('lambda_compute', 0.5)
         self.tau_init = gate_opt.get('tau_init', 2.0)
         self.tau_min = gate_opt.get('tau_min', 0.5)
+        self.gate_warmup_epochs = gate_opt.get('warmup_epochs', 0)
 
     def run(self):
         print0("Training started.")
         while self.epoch < self.num_epochs:
             self.dataset.set_epoch(self.epoch)
+            # --- gate warmup phase ---
+            # model_raw = self._unwrap(self.model)
+            # if self.use_level_gate and model_raw.level_gate is not None:
+            #     if self.epoch < self.gate_warmup_epochs:
+            #         # freeze everything except the gate
+            #         for name, p in model_raw.named_parameters():
+            #             p.requires_grad = 'level_gate' in name
+            #     elif self.epoch == self.gate_warmup_epochs:
+            #         # unfreeze everything
+            #         for p in model_raw.parameters():
+            #             p.requires_grad = True
             if self.opt['_distributed']:
                 self.sampler.set_epoch(self.epoch)
             for data_list in self.dataloader:
@@ -1807,13 +1819,15 @@ class TrainerDecGate:
                     if self.itr == 1 or self.itr % self.log_interval == 0:
                         self.log()
             self.epoch += 1
-            # anneal gating temperature
-            if self.use_level_gate:
-                model = self.model.module if self.opt['_distributed'] else self.model
-                if model.level_gate is not None:
-                    progress = self.epoch / max(self.num_epochs - 1, 1)
-                    tau = self.tau_init + (self.tau_min - self.tau_init) * progress
-                    model.level_gate.set_tau(tau)
+            # --- gate warmup: freeze all except level_gate ---
+            model_raw = self._unwrap(self.model)
+            if (self.use_level_gate
+                and model_raw.level_gate is not None):
+            
+                # tau annealing: linear from tau_init to tau_min over training
+                progress = self.epoch / max(self.num_epochs - 1, 1)
+                new_tau = self.tau_init + (self.tau_min - self.tau_init) * progress
+                model_raw.level_gate.set_tau(new_tau)
             self.checkpoint()
             barrier()
         print0("Training completed.")
@@ -1839,17 +1853,16 @@ class TrainerDecGate:
         )
         ret = {'cls': cls_loss, 'reg': reg_loss, 'total': total_loss}
         if self.use_level_gate:
-            # last microbatch's gate stats (representative enough for logging)
-            ret['compute'] = loss_dict.get('compute', torch.tensor(0.0))
+            # propagate last microbatch's gate stats for logging
             for k, v in loss_dict.items():
-                if k.startswith('g'):
+                if k.startswith('g') or k == 'L_compute':
                     ret[k] = v
         return ret
-
+    
     def _microbatch_forward_backward(self, data_list, is_last=False):
         # batch data
         vid, vid_masks, text, text_masks, text_size = self._batchify(
-            vid_list=[d['vid'] for d in data_list], 
+            vid_list=[d['vid'] for d in data_list],
             text_list=[d['text'] for d in data_list]
         )
         vid = vid.cuda(non_blocking=True)
@@ -1857,53 +1870,150 @@ class TrainerDecGate:
         text = text.cuda(non_blocking=True)
         text_masks = text_masks.cuda(non_blocking=True)
         text_size = text_size.cuda(non_blocking=True)
-
+    
         targets = torch.cat([d['target'] / self.vid_stride for d in data_list])
         targets = targets.cuda(non_blocking=True)
-        
-        # forward pass
+    
+        # --- (a) forward pass: unpack 4 return values ---
         if is_last or not self.opt['_distributed']:
-            fpn_logits, fpn_offsets, fpn_masks, gates = \
+            fpn_logits, fpn_offsets, fpn_masks, gates, soft_gates = \
                 self.model(vid, vid_masks, text, text_masks, text_size)
         else:
             with self.model.no_sync():
-                fpn_logits, fpn_offsets, fpn_masks, gates = \
+                fpn_logits, fpn_offsets, fpn_masks, gates, soft_gates = \
                     self.model(vid, vid_masks, text, text_masks, text_size)
+    
         fpn_n_points = [m.size(-1) for m in fpn_masks]
         fpn_points = self.pt_gen(fpn_n_points)
-
+    
+        # --- (b) build per-point gate weights: (bs, total_points) ---
+        if gates is not None:
+            gate_weights_list = []
+            for l, n_pts in enumerate(fpn_n_points):
+                gate_weights_list.append(
+                    gates[:, l:l+1].expand(-1, n_pts)
+                )
+            gate_weights = torch.cat(gate_weights_list, dim=1)
+        else:
+            gate_weights = None
+    
         # stitch model outputs
         fpn_logits = torch.cat(fpn_logits, dim=1)   # (bs, p)
-        fpn_offsets = torch.cat(fpn_offsets, dim=1) # (bs, p, 2)
-        fpn_masks = torch.cat(fpn_masks, dim=1)     # (bs, p)
-        points = torch.cat(fpn_points)              # (p, 4)
-
+        fpn_offsets = torch.cat(fpn_offsets, dim=1)  # (bs, p, 2)
+        fpn_masks = torch.cat(fpn_masks, dim=1)      # (bs, p)
+        points = torch.cat(fpn_points)               # (p, 4)
+    
         # annotate points
         gt_labels, gt_offsets = self._annotate_points(points, targets)
-
+    
         # calculate point loss
         ## (1) loss norm
         pos_masks = torch.logical_and(gt_labels, fpn_masks)
         norm = pos_masks.sum()
+    
+        ## (2) classification loss — weighted by g_l
+        # if gate_weights is not None:
+        #     # L_task_cls = Σ_l g_l · FocalLoss(c_l, GT_l)
+        #     valid_logits = fpn_logits[fpn_masks]
+        #     valid_labels = gt_labels[fpn_masks].to(valid_logits.dtype)
+        #     valid_labels = valid_labels * 0.8 + 0.1     # smoothing=0.2
+        #     valid_weights = gate_weights[fpn_masks]
+    
+        #     per_point_cls = sigmoid_focal_loss(
+        #         valid_logits, valid_labels, alpha=0.5, reduction='none'
+        #     )
+        #     cls_loss = (per_point_cls * valid_weights).sum() \
+        #         / self.loss_norm * get_world_size()
+        # else:
+        #     cls_loss = self._calc_focal_loss(
+        #         logits=fpn_logits[fpn_masks], labels=gt_labels[fpn_masks]
+        #     ) / self.loss_norm * get_world_size()
+    
+        # ## (3) regression loss — weighted by g_l
+        # if gate_weights is not None:
+        #     # L_task_reg = Σ_l g_l · DiouLoss(r_l, GT_l)
+        #     pos_offsets = fpn_offsets[pos_masks]
+        #     pos_gt = gt_offsets[pos_masks]
+        #     pos_weights = gate_weights[pos_masks]
+    
+        #     iou_loss_fn = ctr_diou_loss if self.reg_loss == 'diou' else ctr_giou_loss
+        #     if pos_offsets.numel() > 0:
+        #         per_point_reg = iou_loss_fn(
+        #             pos_offsets, pos_gt, reduction='none'
+        #         )
+        #         reg_loss = (per_point_reg * pos_weights).sum() \
+        #             / self.loss_norm * get_world_size()
+        #     else:
+        #         reg_loss = 0.0 * fpn_logits.sum()  # keep in graph
+        # else:
+        #     reg_loss = self._calc_iou_loss(
+        #         pred_offsets=fpn_offsets[pos_masks],
+        #         gt_offsets=gt_offsets[pos_masks]
+        #     ) / self.loss_norm * get_world_size()
+        
+        # ## (4) compute loss: L_compute = (Σ_l g_l) / L
+        # if gates is not None:
+        #     compute_loss = self.lambda_compute * gates.mean()
+        # else:
+        #     compute_loss = 0.0
+    
+        # ## (5) total loss
+        # total_loss = cls_loss + self.loss_weight * reg_loss + compute_loss
 
-        ## (2) classification loss on valid points
         cls_loss = self._calc_focal_loss(
             logits=fpn_logits[fpn_masks], labels=gt_labels[fpn_masks]
         ) / self.loss_norm * get_world_size()
-        
-        ## (3) regression loss on positive points
+
         reg_loss = self._calc_iou_loss(
-            pred_offsets=fpn_offsets[pos_masks], gt_offsets=gt_offsets[pos_masks]
+            pred_offsets=fpn_offsets[pos_masks],
+            gt_offsets=gt_offsets[pos_masks]
         ) / self.loss_norm * get_world_size()
 
-        # compute penalty = mean gate activation (encourages pruning)
         if gates is not None:
-            compute_loss = gates.mean() * self.lambda_compute
-        else:
-            compute_loss = 0.0
-        total_loss = cls_loss + self.loss_weight * reg_loss + compute_loss
-        total_loss.backward()
+            with torch.no_grad():
+                scores = torch.sigmoid(fpn_logits) * fpn_masks.float()  # (bs, p)
+                
+                # decode proposals: center +/- offset * stride
+                pt_ctr = points[:, 0]                          # (p,)
+                strides = points[:, 3]                          # (p,)
+                pred_start = pt_ctr - fpn_offsets[..., 0] * strides  # (bs, p)
+                pred_end = pt_ctr + fpn_offsets[..., 1] * strides    # (bs, p)
 
+                # top-5 per query by cls score
+                topk = min(5, scores.size(1))
+                _, topk_idx = scores.topk(topk, dim=1)         # (bs, 5)
+
+                # gather top-5 segments
+                top_start = pred_start.gather(1, topk_idx)     # (bs, 5)
+                top_end = pred_end.gather(1, topk_idx)         # (bs, 5)
+
+                # compute IoU of each with GT
+                gt_start = targets[:, 0:1]                      # (bs, 1)
+                gt_end = targets[:, 1:2]                        # (bs, 1)
+
+                inter_start = torch.max(top_start, gt_start)
+                inter_end = torch.min(top_end, gt_end)
+                inter = (inter_end - inter_start).clamp(min=0)
+
+                union = (top_end - top_start) + (gt_end - gt_start) - inter
+                iou = inter / union.clamp(min=1e-8)            # (bs, 5)
+
+                # reward = best IoU among top-5
+                reward = iou.max(dim=1).values                  # (bs,)
+
+            # REINFORCE: reward the gate's selection
+            log_prob = (
+                gates * torch.log(soft_gates + 1e-8)
+                + (1 - gates) * torch.log(1 - soft_gates + 1e-8)
+            ).sum(dim=-1)                                       # (bs,)
+
+            gate_loss = -(log_prob * reward).mean()
+
+            total_loss = cls_loss + self.loss_weight * reg_loss \
+                    + gate_loss + self.lambda_compute * gates.mean()
+        total_loss.backward()
+    
+        ## (6) build return dict with gate diagnostics
         ret = {
             'cls': cls_loss.detach(),
             'reg': reg_loss.detach(),
@@ -1911,11 +2021,10 @@ class TrainerDecGate:
             'norm': norm.detach(),
         }
         if gates is not None:
-            ret['compute'] = gates.mean().detach()
-            # per-level mean gate activation for logging
+            ret['L_compute'] = (self.lambda_compute * gates.mean()).detach()
             gate_mean = gates.detach().mean(0)  # (num_levels,)
             for l in range(gate_mean.size(0)):
-                ret[f'g{l}'] = gate_mean[l]
+                ret['g{}'.format(l)] = gate_mean[l]
         return ret
 
     def _batchify_videos(self, vid_list):
@@ -2232,8 +2341,8 @@ class EvaluatorDecGate:
                 gt_start, gt_end = target[0], target[1]
                 raw = self._all_fpn_raw[q_idx]  # per-query data
 
-                print(f"\nQuery {q_idx}: GT=({gt_start:.1f}, {gt_end:.1f}), "
-                    f"duration={gt_end - gt_start:.1f}s")
+                # print(f"\nQuery {q_idx}: GT=({gt_start:.1f}, {gt_end:.1f}), "
+                #     f"duration={gt_end - gt_start:.1f}s")
 
                 best_level, best_iou_overall = -1, 0.0
                 for level, (points, logits, offsets, masks) in enumerate(
@@ -2280,9 +2389,9 @@ class EvaluatorDecGate:
                         best_iou_overall = best_iou
                         best_level = level
 
-                    print(f"  Level {level}: best_iou={best_iou:.4f} "
-                        f"cls_prob={best_score:.4f} "
-                        f"seg=({left_sec[best_idx]:.1f}, {right_sec[best_idx]:.1f})")
+                    # print(f"  Level {level}: best_iou={best_iou:.4f} "
+                    #     f"cls_prob={best_score:.4f} "
+                    #     f"seg=({left_sec[best_idx]:.1f}, {right_sec[best_idx]:.1f})")
 
                     # which positions are inside GT?
                     pos_centers = pts[:, 0]  # temporal centers
@@ -2296,9 +2405,9 @@ class EvaluatorDecGate:
                         pos_prob = probs_valid[inside_gt].mean().item()
                         neg_prob = probs_valid[~inside_gt].mean().item()
                         ratio = pos_prob / (neg_prob + 1e-8)
-                        print(f"  Level {level}: pos_cls={pos_prob:.4f} "
-                            f"neg_cls={neg_prob:.4f} ratio={ratio:.2f} "
-                            f"(best_iou={best_iou:.4f})")
+                        # print(f"  Level {level}: pos_cls={pos_prob:.4f} "
+                        #     f"neg_cls={neg_prob:.4f} ratio={ratio:.2f} "
+                        #     f"(best_iou={best_iou:.4f})")
                     
                     per_level_info[level] = {
                         'best_iou': best_iou,
@@ -2345,8 +2454,8 @@ class EvaluatorDecGate:
                 best_source = max(gaps, key=gaps.get)
                 per_level_info['best_source_level'] = best_source
                 per_level_info['best_source_gap'] = gaps[best_source]
-                print(f"  Best source: L{best_source} (gap={gaps[best_source]:.4f}) | "
-                    f"all gaps: " + " ".join(f"L{l}={g:.4f}" for l, g in gaps.items()))
+                # print(f"  Best source: L{best_source} (gap={gaps[best_source]:.4f}) | "
+                #     f"all gaps: " + " ".join(f"L{l}={g:.4f}" for l, g in gaps.items()))
 
                 oracle_stats.append({
                     'gt_duration': gt_end - gt_start,
@@ -2550,7 +2659,7 @@ class EvaluatorDecGate:
 
             fpn_logits_list, fpn_offsets_list = tuple(), tuple()
             for text, text_mask in zip(text_list, text_mask_list):
-                fpn_logits, fpn_offsets, _, _gates = \
+                fpn_logits, fpn_offsets, _, _gates, _soft_gates = \
                     self.model.fuse_and_predict(fpn, fpn_masks, text, text_mask)
                 fpn_logits_list += (fpn_logits, )
                 fpn_offsets_list += (fpn_offsets, )
@@ -2792,7 +2901,1115 @@ class EvaluatorDecGate:
                     f"{(metrics[i, j] * 100):.2f}"
                 )
         self.logger.write(log_str)
+        
+class EvaluatorWithLog:
 
+    def __init__(self, opt, return_features=False):
+
+        self.opt = opt
+        self.return_features = return_features
+
+        # set random seed
+        rng = fix_random_seed(opt.get('seed', 2022))
+
+        self.split_name = opt['eval']['data']['split']
+
+        # prepare dataset
+        dataset = make_dataset(opt['eval']['data'], is_training=False)
+        self.dataloader, _ = make_dataloader(
+            dataset, is_training=False, generator=rng, batch_size=1, num_workers=0
+        )
+        self.num_itrs = len(self.dataloader)
+        self.itr = self.text_cnt = 0
+
+        # load model
+        self.model = PtTransformer(opt['model'], return_features=self.return_features).cuda()
+        self.load_model()
+        self.model.eval().requires_grad_(False)
+        self.pt_gen = PtGenerator(**opt['pt_gen']).cuda()
+
+        # build logging utilities
+        self.log_interval = self.num_itrs // 10
+        self.logger = Logger(os.path.join(opt['_root'], f"{self.split_name}_{opt['_ckpt']}.txt"))
+
+        # register model hyperparameters
+        self.max_vid_len = opt['model']['max_vid_len']
+        self.vid_stride = opt['model'].get('vid_stride', 1)
+        self.input_vid_len = self.max_vid_len * self.vid_stride
+
+        num_fpn_levels = opt['model']['num_fpn_levels']
+        mha_win_size = opt['model']['mha_win_size']
+        ds_strides = [2 ** i for i in range(num_fpn_levels)]
+        min_chunk_size = 1
+        for idx in range(num_fpn_levels):
+            stride = ds_strides[idx]
+            if mha_win_size > 0:
+                stride *= (mha_win_size // 2) * 2
+            min_chunk_size = max(min_chunk_size, stride)
+        assert self.max_vid_len % min_chunk_size == 0, (
+            f"max video length must be a multiple of {min_chunk_size}"
+        )
+        self.min_chunk_size = min_chunk_size
+
+        # register evaluation hyperparameters
+        self.ranks = opt['eval'].get('ranks', (1, 5))
+        self.topk = max(self.ranks)
+        self.iou_threshs = np.array(opt['eval'].get('iou_threshs', (0.3, 0.5)))
+        self.counts = np.zeros((len(self.ranks), len(self.iou_threshs)))
+
+        self.window_size = opt['eval'].get('window_size')
+        self.window_stride = opt['eval'].get('window_stride')
+
+        self.batched_nms = lambda segs, scores: batched_nms(
+            segs, scores, **opt['eval']['nms']
+        )
+        self.pre_nms_topk = opt['eval']['pre_nms_topk']
+        self.pre_nms_thresh = opt['eval']['pre_nms_thresh']
+        self.seg_len_thresh = opt['eval']['seg_len_thresh']
+
+    def load_model(self):
+        filename = os.path.join(
+            self.opt['_root'], 'models', f"{self.opt['_ckpt']}.pth"
+        )
+        ckpt = torch.load(filename, map_location='cpu')
+        if 'model_ema' in ckpt:
+            self.model.load_state_dict(ckpt['model_ema'])
+        elif 'best_ema_state_dict' in ckpt:
+            self.model.load_state_dict(ckpt['best_ema_state_dict'])
+        else:
+            raise KeyError(f"No EMA state dict found in {filename}. "
+                        f"Available keys: {list(ckpt.keys())}")
+        print0(f"Loaded checkpoint [epoch {self.opt['_ckpt']}]...")
+        # self.model.load_state_dict(ckpt['model_ema'])
+        # print0(f"Loaded checkpoint [epoch {self.opt['_ckpt']}]...")
+
+    @torch.no_grad()
+    def run(self):
+        import numpy as np
+        import csv
+
+        print0("Evaluation started.")
+        start_time = time.time()
+
+        # ---- compute FLOPs per forward pass (once) ----
+        flops_per_forward = None
+        try:
+            from fvcore.nn import FlopCountAnalysis
+            # build dummy inputs matching padded shapes
+            first_data = next(iter(self.dataloader))[0]
+            dummy_C = first_data['vid'].size(0)  # feature dim
+            dummy_vid = torch.randn(1, dummy_C, self.input_vid_len).cuda()
+            dummy_vid_mask = torch.ones(
+                1, 1, self.input_vid_len, dtype=torch.bool
+            ).cuda()
+
+            # encoder FLOPs
+            encoder_flops = FlopCountAnalysis(
+                self.model.encode_video, (dummy_vid, dummy_vid_mask)
+            )
+            encoder_flops.unsupported_ops_warnings(False)
+            encoder_flops.uncalled_modules_warnings(False)
+            enc_total = encoder_flops.total()
+
+            # fusion + prediction FLOPs (need actual encoder output shapes)
+            with torch.no_grad():
+                fpn, fpn_masks = self.model.encode_video(dummy_vid, dummy_vid_mask)
+                # use a dummy text embedding
+                dummy_text = first_data['text']
+                if not isinstance(dummy_text, tuple):
+                    dummy_text = (dummy_text,)
+                dummy_text = dummy_text[0][None].cuda()
+                dummy_text_mask = dummy_text.new_full(
+                    (1, 1, dummy_text.size(-1)), 1, dtype=torch.bool
+                ).cuda()
+                dummy_text_enc, dummy_text_mask_enc = \
+                    self.model.encode_text(dummy_text, dummy_text_mask)
+
+            fusion_flops = FlopCountAnalysis(
+                self.model.fuse_and_predict,
+                (fpn, fpn_masks, dummy_text_enc, dummy_text_mask_enc)
+            )
+            fusion_flops.unsupported_ops_warnings(False)
+            fusion_flops.uncalled_modules_warnings(False)
+            fuse_total = fusion_flops.total()
+
+            flops_per_forward = enc_total + fuse_total
+            print0(f"FLOPs per forward pass: "
+                   f"encoder={enc_total/1e9:.2f}G + "
+                   f"fusion={fuse_total/1e9:.2f}G = "
+                   f"total={flops_per_forward/1e9:.2f}G")
+        except ImportError:
+            print0("fvcore not installed — skipping FLOP count. "
+                   "Install with: pip install fvcore")
+        except Exception as e:
+            print0(f"FLOP counting failed ({e}), continuing without it.")
+
+        self.flops_per_forward = flops_per_forward
+
+        # ---- per-sample CSV rows ----
+        sample_rows = []
+        global_sample_idx = 0
+        feature_rows = []
+        for data_list in self.dataloader:
+            results, pred_features = self.predict(data_list[0])
+            targets = data_list[0]['segment']
+
+            # extract metadata
+            video_duration = data_list[0].get('duration', None)
+            video_id = data_list[0].get('video_id',
+                       data_list[0].get('vid_id',
+                       data_list[0].get('id', None)))
+            raw_query = data_list[0].get('query',
+                        data_list[0].get('query_text',
+                        data_list[0].get('text_raw', None)))
+            clip_stride = data_list[0].get('clip_stride', None)
+            clip_size = data_list[0].get('clip_size', None)
+            fps = data_list[0].get('fps', None)
+            vid_len = data_list[0]['vid'].size(-1)
+
+            assert len(results) == len(targets)
+
+            for q_idx, (result, target) in enumerate(zip(results, targets)):
+                segs = result['segments']
+                scores = result['scores']
+                levels = result['levels']
+                offsets_raw = result['offsets']
+
+                idx = scores.argsort(descending=True)
+                segs = segs[idx[:self.topk]]
+                scores = scores[idx[:self.topk]]
+                levels = levels[idx[:self.topk]]
+                offsets_raw = offsets_raw[idx[:self.topk]]
+
+                target_t = torch.as_tensor(target, dtype=torch.float)
+                target_expanded = target_t.expand(len(segs), -1)
+
+                iou_topk = iou(segs, target_expanded)
+                iou_n = np.array([iou_topk[:i].max().item() for i in self.ranks])
+                self.counts += (iou_n[:, None] >= self.iou_threshs[None])
+
+                # ---- build row ----
+                gt_start_val = float(target[0])
+                gt_end_val = float(target[1])
+                gt_dur = gt_end_val - gt_start_val
+
+                r1_iou = iou_topk[:1].max().item() if len(iou_topk) > 0 else 0.0
+                r5_iou = iou_topk[:5].max().item() if len(iou_topk) > 0 else 0.0
+
+                n_proposals = len(segs)
+
+                score_gap_r1_r2 = None
+                if len(scores) >= 2:
+                    score_gap_r1_r2 = (scores[0] - scores[1]).item()
+
+                query_str = None
+                if raw_query is not None:
+                    if isinstance(raw_query, (list, tuple)):
+                        query_str = str(raw_query[q_idx]) if q_idx < len(raw_query) else str(raw_query)
+                    elif isinstance(raw_query, str):
+                        query_str = raw_query
+
+                row = {
+                    'sample_idx': global_sample_idx,
+                    'video_id': video_id,
+                    'query': query_str,
+                    'gt_start': gt_start_val,
+                    'gt_end': gt_end_val,
+                    'gt_duration': gt_dur,
+                    'video_duration': video_duration,
+                    'gt_moment_fraction': gt_dur / video_duration if video_duration else None,
+                    'vid_feat_len': vid_len,
+                    'fps': fps,
+                    'clip_stride': clip_stride,
+                    'clip_size': clip_size,
+                    'r1_iou': r1_iou,
+                    'r5_iou': r5_iou,
+                    'r5_minus_r1_iou': r5_iou - r1_iou,
+                    'n_proposals_after_nms': n_proposals,
+                    'score_gap_r1_r2': score_gap_r1_r2,
+                    # compute proxies
+                    'n_windows': self._n_windows,
+                    'query_token_len': self._query_token_lens[q_idx] if q_idx < len(self._query_token_lens) else None,
+                    'flops_per_forward': self.flops_per_forward,
+                    'total_flops': (self._n_windows * self.flops_per_forward) if self.flops_per_forward else None,
+                }
+
+                # top-5 proposal details: level, cls score, iou, segment, offsets
+                k = min(5, len(segs))
+                for i in range(5):
+                    if i < k:
+                        row[f'top{i+1}_level'] = levels[i].item()
+                        row[f'top{i+1}_score'] = scores[i].item()
+                        row[f'top{i+1}_iou'] = iou_topk[i].item()
+                        row[f'top{i+1}_seg_start'] = segs[i, 0].item()
+                        row[f'top{i+1}_seg_end'] = segs[i, 1].item()
+                        row[f'top{i+1}_offset_left'] = offsets_raw[i, 0].item()
+                        row[f'top{i+1}_offset_right'] = offsets_raw[i, 1].item()
+                    else:
+                        row[f'top{i+1}_level'] = None
+                        row[f'top{i+1}_score'] = None
+                        row[f'top{i+1}_iou'] = None
+                        row[f'top{i+1}_seg_start'] = None
+                        row[f'top{i+1}_seg_end'] = None
+                        row[f'top{i+1}_offset_left'] = None
+                        row[f'top{i+1}_offset_right'] = None
+
+                sample_idx_this_query = global_sample_idx
+                sample_rows.append(row)
+
+                if self.return_features and pred_features is not None:
+                    feat_item = {
+                        'sample_idx': sample_idx_this_query,
+                        'video_id': video_id,
+                        'query': query_str,
+                        'split': self.split_name,
+                        'features': pred_features[q_idx] if q_idx < len(pred_features) else None,
+                    }
+                    feature_rows.append(feat_item)
+
+                global_sample_idx += 1
+
+            self.text_cnt += len(targets)
+            self.itr += 1
+
+            if self.itr == 1 or self.itr % self.log_interval == 0:
+                self.log()
+
+        # ---- save per-sample CSV ----
+        csv_path = os.path.join(
+            self.opt['_root'],
+            f"per_sample_{self.split_name}_{self.opt['_ckpt']}.csv"
+        )
+        if sample_rows:
+            fieldnames = list(sample_rows[0].keys())
+            with open(csv_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(sample_rows)
+            print0(f"\nPer-sample CSV saved to: {csv_path}")
+            print0(f"  Total samples: {len(sample_rows)}")
+            print0(f"  Columns: {len(fieldnames)}")
+        
+        if self.return_features and feature_rows:
+            feature_path = os.path.join(
+                self.opt['_root'],
+                f"features_{self.split_name}_{self.opt['_ckpt']}.pt"
+            )
+            torch.save(feature_rows, feature_path)
+            print0(f"Feature file saved to: {feature_path}")
+            print0(f"  Total feature rows: {len(feature_rows)}")
+
+        self.log(is_last=True)
+        print0(f"Evaluation completed in {time_str(time.time() - start_time)}.")
+
+    def predict(self, data):
+        """ Predict event segments given a single video and an arbitrary
+        number of text queries. This function assumes single-GPU evaluation.
+        """
+        query_feature_accumulators = None
+        # parse text
+        tokens = data['text']
+        if not isinstance(tokens, tuple):
+            tokens = (tokens, )
+
+        text_list, text_mask_list = tuple(), tuple()
+        for text in tokens:
+            text = text[None]
+            text_mask = text.new_full(
+                (1, 1, text.size(-1)), 1, dtype=torch.bool
+            )
+            text = text.cuda(non_blocking=True)
+            text_mask = text_mask.cuda(non_blocking=True)
+
+            text, text_mask = self.model.encode_text(text, text_mask)
+            text_list += (text, )
+            text_mask_list += (text_mask, )
+
+        # parse video
+        vid = data['vid']
+        vid_len = vid.size(-1)
+
+        # external scores (n, t)
+        ext_scores = data['ext_scores']
+        if ext_scores is not None and ext_scores.ndim == 1:
+            ext_scores = ext_scores[None]
+
+        # sliding-window evaluation
+        window_size = min(self.window_size or vid_len, vid_len)
+        window_stride = self.window_stride or window_size
+
+        n = vid_len - window_size
+        windows, window_offsets, window_ext_scores = tuple(), tuple(), tuple()
+
+        idx = 0
+        while idx <= n:
+            windows += (vid[..., idx:idx + window_size], )
+            window_offsets += (idx, )
+            if ext_scores is not None:
+                window_ext_scores += (ext_scores[..., idx:idx + window_size], )
+            else:
+                window_ext_scores += (None, )
+            idx += window_stride
+
+        if n > 0 and n % window_stride > 0:
+            windows += (vid[..., -window_size:], )
+            window_offsets += (n, )
+            if ext_scores is not None:
+                window_ext_scores += (ext_scores[..., -window_size:], )
+            else:
+                window_ext_scores += (None, )
+
+        input_vid_len = self.input_vid_len
+        if window_size > input_vid_len:
+            stride = self.min_chunk_size * self.vid_stride
+            input_vid_len = (window_size + (stride - 1)) // stride * stride
+
+        # track per-sample compute proxies
+        self._n_windows = len(windows)
+        self._query_token_lens = [t.size(-1) for t in text_list]
+
+        segs_list, scores_list = tuple(), tuple()
+        levels_list, offsets_raw_list = tuple(), tuple()
+
+        for window, window_offset, window_ext in \
+            zip(windows, window_offsets, window_ext_scores):
+            window = F.pad(window, (0, input_vid_len - window_size))[None]
+            window_mask = torch.arange(input_vid_len).view(1, 1, -1) < window_size
+            window = window.cuda(non_blocking=True)
+            window_mask = window_mask.cuda(non_blocking=True)
+            if window_ext is not None:
+                window_ext = F.pad(window_ext, (0, input_vid_len - window_size))
+                window_ext = window_ext.cuda(non_blocking=True)
+
+            fpn, fpn_masks = self.model.encode_video(window, window_mask)
+            fpn_n_points = [m.size(-1) for m in fpn_masks]
+            fpn_points = self.pt_gen(fpn_n_points)
+
+            fpn_logits_list, fpn_offsets_list = tuple(), tuple()
+            for q_idx, (text, text_mask) in enumerate(zip(text_list, text_mask_list)):
+                fpn_logits, fpn_offsets, _, feat_dict = \
+                    self.model.fuse_and_predict(fpn, fpn_masks, text, text_mask)
+                fpn_logits_list += (fpn_logits, )
+                fpn_offsets_list += (fpn_offsets, )
+
+                if self.return_features:
+                    if query_feature_accumulators is None:
+                        query_feature_accumulators = [dict() for _ in range(len(text_list))]
+                    self._accumulate_query_features(
+                        query_feature_accumulators[q_idx],
+                        feat_dict,
+                        window_offset=window_offset
+                    )
+
+            fpn_masks = [m.squeeze(1) for m in fpn_masks]
+
+            window_segs_list, window_scores_list = tuple(), tuple()
+            window_levels_list, window_offsets_raw_list = tuple(), tuple()
+
+            for idx, (fpn_logits, fpn_offsets) in \
+                enumerate(zip(fpn_logits_list, fpn_offsets_list)):
+
+                w_segs, w_scores, w_levels, w_offsets_raw = \
+                    self._collect_segments(
+                        fpn_points, fpn_logits, fpn_offsets, fpn_masks,
+                        window_ext[idx] if window_ext is not None else None
+                    )
+                w_segs += window_offset / self.vid_stride
+                window_segs_list += (w_segs.cpu(), )
+                window_scores_list += (w_scores.cpu(), )
+                window_levels_list += (w_levels.cpu(), )
+                window_offsets_raw_list += (w_offsets_raw.cpu(), )
+
+            segs_list += (window_segs_list, )
+            scores_list += (window_scores_list, )
+            levels_list += (window_levels_list, )
+            offsets_raw_list += (window_offsets_raw_list, )
+
+        segs_list = [torch.cat(x) for x in zip(*segs_list)]
+        scores_list = [torch.cat(x) for x in zip(*scores_list)]
+        levels_list = [torch.cat(x) for x in zip(*levels_list)]
+        offsets_raw_list = [torch.cat(x) for x in zip(*offsets_raw_list)]
+
+        results = tuple()
+        for segs, scores, levels, offsets_raw in \
+            zip(segs_list, scores_list, levels_list, offsets_raw_list):
+            # top-k pre-NMS
+            n_topk = min(len(segs), self.pre_nms_topk)
+            idx = scores.argsort(descending=True)[:n_topk]
+            pre_nms_segs = segs[idx]
+            pre_nms_scores = scores[idx]
+            pre_nms_levels = levels[idx]
+            pre_nms_offsets = offsets_raw[idx]
+
+            # NMS
+            post_nms_segs, post_nms_scores = self.batched_nms(
+                pre_nms_segs, pre_nms_scores
+            )
+
+            # recover level/offset info by matching post-NMS back to pre-NMS
+            # (standard NMS preserves segment coordinates exactly)
+            if len(post_nms_segs) > 0 and len(pre_nms_segs) > 0:
+                diffs = (post_nms_segs.unsqueeze(1)
+                         - pre_nms_segs.unsqueeze(0)).abs().sum(-1)
+                matched_idx = diffs.argmin(dim=1)
+                post_nms_levels = pre_nms_levels[matched_idx]
+                post_nms_offsets = pre_nms_offsets[matched_idx]
+            else:
+                post_nms_levels = torch.zeros(0, dtype=torch.long)
+                post_nms_offsets = torch.zeros(0, 2)
+
+            # convert segments to timestamps
+            if len(post_nms_segs) > 0:
+                clip_stride = data['clip_stride']
+                clip_size = data['clip_size']
+                fps = data['fps']
+                duration = data['duration']
+
+                post_nms_segs *= self.vid_stride
+                post_nms_segs = (post_nms_segs * clip_stride
+                                 + 0.5 * clip_size) / fps
+                post_nms_segs = torch.clamp(post_nms_segs, min=0, max=duration)
+
+            results += ({
+                'segments': post_nms_segs,
+                'scores': post_nms_scores,
+                'levels': post_nms_levels,
+                'offsets': post_nms_offsets,
+            }, )
+        
+        packed_features = None
+        if self.return_features:
+            packed_features = self._finalize_query_features(query_feature_accumulators)
+
+        return results, packed_features
+
+    def _collect_segments(
+        self,
+        fpn_points,     # List[(p, 4) * #levels]
+        fpn_logits,     # List[(1, p) * #levels]
+        fpn_offsets,    # List[(1, p, 2) * #levels]
+        fpn_masks,      # List[(1, p) * #levels]
+        ext_scores,     # (p, )
+    ):
+        points_list, scores_list, offsets_list = tuple(), tuple(), tuple()
+        levels_list, offsets_raw_list = tuple(), tuple()
+
+        # loop over all FPN levels
+        for level, (points, logits, offsets, masks) in enumerate(
+            zip(fpn_points, fpn_logits, fpn_offsets, fpn_masks)
+        ):
+            logits, offsets, masks = logits[0], offsets[0], masks[0]
+
+            # compute point scores
+            scores = torch.sigmoid(logits)
+            if ext_scores is not None:
+                scores *= ext_scores
+                ext_scores = F.max_pool1d(
+                    ext_scores[None, None], kernel_size=3, stride=2, padding=1
+                )[0, 0]
+            scores *= masks.float()
+
+            # filter by confidence threshold
+            idx = scores > self.pre_nms_thresh
+            points_list += (points[idx], )
+            scores_list += (scores[idx], )
+            offsets_list += (offsets[idx], )
+            offsets_raw_list += (offsets[idx].clone(), )
+            levels_list += (
+                torch.full((idx.sum(),), level,
+                           dtype=torch.long, device=points.device),
+            )
+
+        points = torch.cat(points_list)
+        scores = torch.cat(scores_list)
+        offsets = torch.cat(offsets_list)
+        offsets_raw = torch.cat(offsets_raw_list)
+        levels = torch.cat(levels_list)
+
+        # only keep top-k scoring boxes
+        n_topk = min(len(points), self.pre_nms_topk)
+        idx = scores.argsort(descending=True)[:n_topk]
+        points, scores, offsets = points[idx], scores[idx], offsets[idx]
+        offsets_raw = offsets_raw[idx]
+        levels = levels[idx]
+
+        # assemble predicted segments
+        pt_ctr = points[:, 0]
+        left = pt_ctr - offsets[:, 0] * points[:, 3]
+        right = pt_ctr + offsets[:, 1] * points[:, 3]
+        segs = torch.stack((left, right), dim=-1)
+
+        # filter segments by length threshold
+        seg_lens = right - left
+        idx = seg_lens > self.seg_len_thresh
+        segs, scores = segs[idx], scores[idx]
+        levels = levels[idx]
+        offsets_raw = offsets_raw[idx]
+
+        return segs, scores, levels, offsets_raw
+
+    def log(self, is_last=False):
+        metrics = self.counts / self.text_cnt
+        log_str = "\nFinal:" if is_last else f"\n[{self.itr}/{self.num_itrs}]"
+        for i, rank in enumerate(self.ranks):
+            log_str += "\n-----"
+            for j, thresh in enumerate(self.iou_threshs):
+                log_str += (
+                    f"\nRank@{rank}, IoU@{thresh:.1f}: "
+                    f"{(metrics[i, j] * 100):.2f}"
+                )
+        self.logger.write(log_str)
+
+    def _accumulate_query_features(self, acc, feat_dict, window_offset=0):
+        if feat_dict is None:
+            return
+
+        for k, v in feat_dict.items():
+            if v is None:
+                continue
+            acc.setdefault(k, []).append(self._to_cpu_detached(v))
+    
+    def _to_cpu_detached(self, x):
+        if torch.is_tensor(x):
+            return x.detach().cpu()
+        elif isinstance(x, dict):
+            return {k: self._to_cpu_detached(v) for k, v in x.items()}
+        elif isinstance(x, list):
+            return [self._to_cpu_detached(v) for v in x]
+        elif isinstance(x, tuple):
+            return tuple(self._to_cpu_detached(v) for v in x)
+        else:
+            return x
+    
+    def _finalize_query_features(self, query_feature_accumulators):
+        if query_feature_accumulators is None:
+            return None
+
+        finalized = []
+        for acc in query_feature_accumulators:
+            out = {}
+            for k, vals in acc.items():
+                if len(vals) == 0:
+                    out[k] = None
+                    continue
+
+                # tensor list면 그냥 list로 두는 게 제일 안전
+                # stage마다 shape 다를 수 있어서 억지 stack은 나중에 실패할 수 있음
+                out[k] = vals
+            finalized.append(out)
+
+        return finalized
+
+class EvaluatorWithLogUsingTrainSet:
+
+    def __init__(self, opt):
+
+        self.opt = opt
+
+        # set random seed
+        rng = fix_random_seed(opt.get('seed', 2022))
+
+        # prepare dataset
+        dataset = make_dataset(opt['train']['data'], is_training=False)
+        self.dataloader, _ = make_dataloader(
+            dataset, is_training=False, generator=rng, batch_size=1, num_workers=0
+        )
+        self.num_itrs = len(self.dataloader)
+        self.itr = self.text_cnt = 0
+
+        # load model
+        self.model = PtTransformer(opt['model']).cuda()
+        self.load_model()
+        self.model.eval().requires_grad_(False)
+        self.pt_gen = PtGenerator(**opt['pt_gen']).cuda()
+
+        # build logging utilities
+        self.log_interval = self.num_itrs // 10
+        self.logger = Logger(os.path.join(opt['_root'], f"eval_{opt['_ckpt']}_train.txt"))
+
+        # register model hyperparameters
+        self.max_vid_len = opt['model']['max_vid_len']
+        self.vid_stride = opt['model'].get('vid_stride', 1)
+        self.input_vid_len = self.max_vid_len * self.vid_stride
+
+        num_fpn_levels = opt['model']['num_fpn_levels']
+        mha_win_size = opt['model']['mha_win_size']
+        ds_strides = [2 ** i for i in range(num_fpn_levels)]
+        min_chunk_size = 1
+        for idx in range(num_fpn_levels):
+            stride = ds_strides[idx]
+            if mha_win_size > 0:
+                stride *= (mha_win_size // 2) * 2
+            min_chunk_size = max(min_chunk_size, stride)
+        assert self.max_vid_len % min_chunk_size == 0, (
+            f"max video length must be a multiple of {min_chunk_size}"
+        )
+        self.min_chunk_size = min_chunk_size
+
+        # register evaluation hyperparameters
+        self.ranks = opt['eval'].get('ranks', (1, 5))
+        self.topk = max(self.ranks)
+        self.iou_threshs = np.array(opt['eval'].get('iou_threshs', (0.3, 0.5)))
+        self.counts = np.zeros((len(self.ranks), len(self.iou_threshs)))
+
+        self.window_size = opt['eval'].get('window_size')
+        self.window_stride = opt['eval'].get('window_stride')
+
+        self.batched_nms = lambda segs, scores: batched_nms(
+            segs, scores, **opt['eval']['nms']
+        )
+        self.pre_nms_topk = opt['eval']['pre_nms_topk']
+        self.pre_nms_thresh = opt['eval']['pre_nms_thresh']
+        self.seg_len_thresh = opt['eval']['seg_len_thresh']
+
+    def load_model(self):
+        filename = os.path.join(
+            self.opt['_root'], 'models', f"{self.opt['_ckpt']}.pth"
+        )
+        ckpt = torch.load(filename, map_location='cpu')
+        self.model.load_state_dict(ckpt['model_ema'])
+        print0(f"Loaded checkpoint [epoch {self.opt['_ckpt']}]...")
+
+    @torch.no_grad()
+    def run(self):
+        import numpy as np
+        import csv
+
+        print0("Evaluation started.")
+        start_time = time.time()
+
+        # ---- compute FLOPs per forward pass (once) ----
+        flops_per_forward = None
+        try:
+            from fvcore.nn import FlopCountAnalysis
+            # build dummy inputs matching padded shapes
+            first_data = next(iter(self.dataloader))[0]
+            dummy_C = first_data['vid'].size(0)  # feature dim
+            dummy_vid = torch.randn(1, dummy_C, self.input_vid_len).cuda()
+            dummy_vid_mask = torch.ones(
+                1, 1, self.input_vid_len, dtype=torch.bool
+            ).cuda()
+
+            # encoder FLOPs
+            encoder_flops = FlopCountAnalysis(
+                self.model.encode_video, (dummy_vid, dummy_vid_mask)
+            )
+            encoder_flops.unsupported_ops_warnings(False)
+            encoder_flops.uncalled_modules_warnings(False)
+            enc_total = encoder_flops.total()
+
+            # fusion + prediction FLOPs (need actual encoder output shapes)
+            with torch.no_grad():
+                fpn, fpn_masks = self.model.encode_video(dummy_vid, dummy_vid_mask)
+                # use a dummy text embedding
+                dummy_text = first_data['text']
+                if not isinstance(dummy_text, tuple):
+                    dummy_text = (dummy_text,)
+                dummy_text = dummy_text[0][None].cuda()
+                dummy_text_mask = dummy_text.new_full(
+                    (1, 1, dummy_text.size(-1)), 1, dtype=torch.bool
+                ).cuda()
+                dummy_text_enc, dummy_text_mask_enc = \
+                    self.model.encode_text(dummy_text, dummy_text_mask)
+
+            fusion_flops = FlopCountAnalysis(
+                self.model.fuse_and_predict,
+                (fpn, fpn_masks, dummy_text_enc, dummy_text_mask_enc)
+            )
+            fusion_flops.unsupported_ops_warnings(False)
+            fusion_flops.uncalled_modules_warnings(False)
+            fuse_total = fusion_flops.total()
+
+            flops_per_forward = enc_total + fuse_total
+            print0(f"FLOPs per forward pass: "
+                   f"encoder={enc_total/1e9:.2f}G + "
+                   f"fusion={fuse_total/1e9:.2f}G = "
+                   f"total={flops_per_forward/1e9:.2f}G")
+        except ImportError:
+            print0("fvcore not installed — skipping FLOP count. "
+                   "Install with: pip install fvcore")
+        except Exception as e:
+            print0(f"FLOP counting failed ({e}), continuing without it.")
+
+        self.flops_per_forward = flops_per_forward
+
+        # ---- per-sample CSV rows ----
+        sample_rows = []
+        global_sample_idx = 0
+
+        for data_list in self.dataloader:
+            results = self.predict(data_list[0])
+            targets = data_list[0]['segment']
+
+            # extract metadata
+            video_duration = data_list[0].get('duration', None)
+            video_id = data_list[0].get('video_id',
+                       data_list[0].get('vid_id',
+                       data_list[0].get('id', None)))
+            raw_query = data_list[0].get('query',
+                        data_list[0].get('query_text',
+                        data_list[0].get('text_raw', None)))
+            clip_stride = data_list[0].get('clip_stride', None)
+            clip_size = data_list[0].get('clip_size', None)
+            fps = data_list[0].get('fps', None)
+            vid_len = data_list[0]['vid'].size(-1)
+
+            assert len(results) == len(targets)
+
+            for q_idx, (result, target) in enumerate(zip(results, targets)):
+                segs = result['segments']
+                scores = result['scores']
+                levels = result['levels']
+                offsets_raw = result['offsets']
+
+                idx = scores.argsort(descending=True)
+                segs = segs[idx[:self.topk]]
+                scores = scores[idx[:self.topk]]
+                levels = levels[idx[:self.topk]]
+                offsets_raw = offsets_raw[idx[:self.topk]]
+
+                target_t = torch.as_tensor(target, dtype=torch.float)
+                target_expanded = target_t.expand(len(segs), -1)
+
+                iou_topk = iou(segs, target_expanded)
+                iou_n = np.array([iou_topk[:i].max().item() for i in self.ranks])
+                self.counts += (iou_n[:, None] >= self.iou_threshs[None])
+
+                # ---- build row ----
+                gt_start_val = float(target[0])
+                gt_end_val = float(target[1])
+                gt_dur = gt_end_val - gt_start_val
+
+                r1_iou = iou_topk[:1].max().item() if len(iou_topk) > 0 else 0.0
+                r5_iou = iou_topk[:5].max().item() if len(iou_topk) > 0 else 0.0
+
+                n_proposals = len(segs)
+
+                score_gap_r1_r2 = None
+                if len(scores) >= 2:
+                    score_gap_r1_r2 = (scores[0] - scores[1]).item()
+
+                query_str = None
+                if raw_query is not None:
+                    if isinstance(raw_query, (list, tuple)):
+                        query_str = str(raw_query[q_idx]) if q_idx < len(raw_query) else str(raw_query)
+                    elif isinstance(raw_query, str):
+                        query_str = raw_query
+
+                row = {
+                    'sample_idx': global_sample_idx,
+                    'video_id': video_id,
+                    'query': query_str,
+                    'gt_start': gt_start_val,
+                    'gt_end': gt_end_val,
+                    'gt_duration': gt_dur,
+                    'video_duration': video_duration,
+                    'gt_moment_fraction': gt_dur / video_duration if video_duration else None,
+                    'vid_feat_len': vid_len,
+                    'fps': fps,
+                    'clip_stride': clip_stride,
+                    'clip_size': clip_size,
+                    'r1_iou': r1_iou,
+                    'r5_iou': r5_iou,
+                    'r5_minus_r1_iou': r5_iou - r1_iou,
+                    'n_proposals_after_nms': n_proposals,
+                    'score_gap_r1_r2': score_gap_r1_r2,
+                    # compute proxies
+                    'n_windows': self._n_windows,
+                    'query_token_len': self._query_token_lens[q_idx] if q_idx < len(self._query_token_lens) else None,
+                    'flops_per_forward': self.flops_per_forward,
+                    'total_flops': (self._n_windows * self.flops_per_forward) if self.flops_per_forward else None,
+                }
+
+                # top-5 proposal details: level, cls score, iou, segment, offsets
+                k = min(5, len(segs))
+                for i in range(5):
+                    if i < k:
+                        row[f'top{i+1}_level'] = levels[i].item()
+                        row[f'top{i+1}_score'] = scores[i].item()
+                        row[f'top{i+1}_iou'] = iou_topk[i].item()
+                        row[f'top{i+1}_seg_start'] = segs[i, 0].item()
+                        row[f'top{i+1}_seg_end'] = segs[i, 1].item()
+                        row[f'top{i+1}_offset_left'] = offsets_raw[i, 0].item()
+                        row[f'top{i+1}_offset_right'] = offsets_raw[i, 1].item()
+                    else:
+                        row[f'top{i+1}_level'] = None
+                        row[f'top{i+1}_score'] = None
+                        row[f'top{i+1}_iou'] = None
+                        row[f'top{i+1}_seg_start'] = None
+                        row[f'top{i+1}_seg_end'] = None
+                        row[f'top{i+1}_offset_left'] = None
+                        row[f'top{i+1}_offset_right'] = None
+
+                sample_rows.append(row)
+                global_sample_idx += 1
+
+            self.text_cnt += len(targets)
+            self.itr += 1
+
+            if self.itr == 1 or self.itr % self.log_interval == 0:
+                self.log()
+
+        # ---- save per-sample CSV ----
+        csv_path = os.path.join(
+            self.opt['_root'],
+            f"per_sample_eval_{self.opt['_ckpt']}_trainset.csv"
+        )
+        if sample_rows:
+            fieldnames = list(sample_rows[0].keys())
+            with open(csv_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(sample_rows)
+            print0(f"\nPer-sample CSV saved to: {csv_path}")
+            print0(f"  Total samples: {len(sample_rows)}")
+            print0(f"  Columns: {len(fieldnames)}")
+
+        self.log(is_last=True)
+        print0(f"Evaluation completed in {time_str(time.time() - start_time)}.")
+
+    def predict(self, data):
+        """ Predict event segments given a single video and an arbitrary
+        number of text queries. This function assumes single-GPU evaluation.
+        """
+        # parse text
+        tokens = data['text']
+        if not isinstance(tokens, tuple):
+            tokens = (tokens, )
+
+        text_list, text_mask_list = tuple(), tuple()
+        for text in tokens:
+            text = text[None]
+            text_mask = text.new_full(
+                (1, 1, text.size(-1)), 1, dtype=torch.bool
+            )
+            text = text.cuda(non_blocking=True)
+            text_mask = text_mask.cuda(non_blocking=True)
+
+            text, text_mask = self.model.encode_text(text, text_mask)
+            text_list += (text, )
+            text_mask_list += (text_mask, )
+
+        # parse video
+        vid = data['vid']
+        vid_len = vid.size(-1)
+
+        # external scores (n, t)
+        ext_scores = data['ext_scores']
+        if ext_scores is not None and ext_scores.ndim == 1:
+            ext_scores = ext_scores[None]
+
+        # sliding-window evaluation
+        window_size = min(self.window_size or vid_len, vid_len)
+        window_stride = self.window_stride or window_size
+
+        n = vid_len - window_size
+        windows, window_offsets, window_ext_scores = tuple(), tuple(), tuple()
+
+        idx = 0
+        while idx <= n:
+            windows += (vid[..., idx:idx + window_size], )
+            window_offsets += (idx, )
+            if ext_scores is not None:
+                window_ext_scores += (ext_scores[..., idx:idx + window_size], )
+            else:
+                window_ext_scores += (None, )
+            idx += window_stride
+
+        if n > 0 and n % window_stride > 0:
+            windows += (vid[..., -window_size:], )
+            window_offsets += (n, )
+            if ext_scores is not None:
+                window_ext_scores += (ext_scores[..., -window_size:], )
+            else:
+                window_ext_scores += (None, )
+
+        input_vid_len = self.input_vid_len
+        if window_size > input_vid_len:
+            stride = self.min_chunk_size * self.vid_stride
+            input_vid_len = (window_size + (stride - 1)) // stride * stride
+
+        # track per-sample compute proxies
+        self._n_windows = len(windows)
+        self._query_token_lens = [t.size(-1) for t in text_list]
+
+        segs_list, scores_list = tuple(), tuple()
+        levels_list, offsets_raw_list = tuple(), tuple()
+
+        for window, window_offset, window_ext in \
+            zip(windows, window_offsets, window_ext_scores):
+            window = F.pad(window, (0, input_vid_len - window_size))[None]
+            window_mask = torch.arange(input_vid_len).view(1, 1, -1) < window_size
+            window = window.cuda(non_blocking=True)
+            window_mask = window_mask.cuda(non_blocking=True)
+            if window_ext is not None:
+                window_ext = F.pad(window_ext, (0, input_vid_len - window_size))
+                window_ext = window_ext.cuda(non_blocking=True)
+
+            fpn, fpn_masks = self.model.encode_video(window, window_mask)
+            fpn_n_points = [m.size(-1) for m in fpn_masks]
+            fpn_points = self.pt_gen(fpn_n_points)
+
+            fpn_logits_list, fpn_offsets_list = tuple(), tuple()
+            for text, text_mask in zip(text_list, text_mask_list):
+                fpn_logits, fpn_offsets, _, _ = \
+                    self.model.fuse_and_predict(fpn, fpn_masks, text, text_mask)
+                fpn_logits_list += (fpn_logits, )
+                fpn_offsets_list += (fpn_offsets, )
+            fpn_masks = [m.squeeze(1) for m in fpn_masks]
+
+            window_segs_list, window_scores_list = tuple(), tuple()
+            window_levels_list, window_offsets_raw_list = tuple(), tuple()
+
+            for idx, (fpn_logits, fpn_offsets) in \
+                enumerate(zip(fpn_logits_list, fpn_offsets_list)):
+
+                w_segs, w_scores, w_levels, w_offsets_raw = \
+                    self._collect_segments(
+                        fpn_points, fpn_logits, fpn_offsets, fpn_masks,
+                        window_ext[idx] if window_ext is not None else None
+                    )
+                w_segs += window_offset / self.vid_stride
+                window_segs_list += (w_segs.cpu(), )
+                window_scores_list += (w_scores.cpu(), )
+                window_levels_list += (w_levels.cpu(), )
+                window_offsets_raw_list += (w_offsets_raw.cpu(), )
+
+            segs_list += (window_segs_list, )
+            scores_list += (window_scores_list, )
+            levels_list += (window_levels_list, )
+            offsets_raw_list += (window_offsets_raw_list, )
+
+        segs_list = [torch.cat(x) for x in zip(*segs_list)]
+        scores_list = [torch.cat(x) for x in zip(*scores_list)]
+        levels_list = [torch.cat(x) for x in zip(*levels_list)]
+        offsets_raw_list = [torch.cat(x) for x in zip(*offsets_raw_list)]
+
+        results = tuple()
+        for segs, scores, levels, offsets_raw in \
+            zip(segs_list, scores_list, levels_list, offsets_raw_list):
+            # top-k pre-NMS
+            n_topk = min(len(segs), self.pre_nms_topk)
+            idx = scores.argsort(descending=True)[:n_topk]
+            pre_nms_segs = segs[idx]
+            pre_nms_scores = scores[idx]
+            pre_nms_levels = levels[idx]
+            pre_nms_offsets = offsets_raw[idx]
+
+            # NMS
+            post_nms_segs, post_nms_scores = self.batched_nms(
+                pre_nms_segs, pre_nms_scores
+            )
+
+            # recover level/offset info by matching post-NMS back to pre-NMS
+            # (standard NMS preserves segment coordinates exactly)
+            if len(post_nms_segs) > 0 and len(pre_nms_segs) > 0:
+                diffs = (post_nms_segs.unsqueeze(1)
+                         - pre_nms_segs.unsqueeze(0)).abs().sum(-1)
+                matched_idx = diffs.argmin(dim=1)
+                post_nms_levels = pre_nms_levels[matched_idx]
+                post_nms_offsets = pre_nms_offsets[matched_idx]
+            else:
+                post_nms_levels = torch.zeros(0, dtype=torch.long)
+                post_nms_offsets = torch.zeros(0, 2)
+
+            # convert segments to timestamps
+            if len(post_nms_segs) > 0:
+                clip_stride = data['clip_stride']
+                clip_size = data['clip_size']
+                fps = data['fps']
+                duration = data['duration']
+
+                post_nms_segs *= self.vid_stride
+                post_nms_segs = (post_nms_segs * clip_stride
+                                 + 0.5 * clip_size) / fps
+                post_nms_segs = torch.clamp(post_nms_segs, min=0, max=duration)
+
+            results += ({
+                'segments': post_nms_segs,
+                'scores': post_nms_scores,
+                'levels': post_nms_levels,
+                'offsets': post_nms_offsets,
+            }, )
+
+        return results
+
+    def _collect_segments(
+        self,
+        fpn_points,     # List[(p, 4) * #levels]
+        fpn_logits,     # List[(1, p) * #levels]
+        fpn_offsets,    # List[(1, p, 2) * #levels]
+        fpn_masks,      # List[(1, p) * #levels]
+        ext_scores,     # (p, )
+    ):
+        points_list, scores_list, offsets_list = tuple(), tuple(), tuple()
+        levels_list, offsets_raw_list = tuple(), tuple()
+
+        # loop over all FPN levels
+        for level, (points, logits, offsets, masks) in enumerate(
+            zip(fpn_points, fpn_logits, fpn_offsets, fpn_masks)
+        ):
+            logits, offsets, masks = logits[0], offsets[0], masks[0]
+
+            # compute point scores
+            scores = torch.sigmoid(logits)
+            if ext_scores is not None:
+                scores *= ext_scores
+                ext_scores = F.max_pool1d(
+                    ext_scores[None, None], kernel_size=3, stride=2, padding=1
+                )[0, 0]
+            scores *= masks.float()
+
+            # filter by confidence threshold
+            idx = scores > self.pre_nms_thresh
+            points_list += (points[idx], )
+            scores_list += (scores[idx], )
+            offsets_list += (offsets[idx], )
+            offsets_raw_list += (offsets[idx].clone(), )
+            levels_list += (
+                torch.full((idx.sum(),), level,
+                           dtype=torch.long, device=points.device),
+            )
+
+        points = torch.cat(points_list)
+        scores = torch.cat(scores_list)
+        offsets = torch.cat(offsets_list)
+        offsets_raw = torch.cat(offsets_raw_list)
+        levels = torch.cat(levels_list)
+
+        # only keep top-k scoring boxes
+        n_topk = min(len(points), self.pre_nms_topk)
+        idx = scores.argsort(descending=True)[:n_topk]
+        points, scores, offsets = points[idx], scores[idx], offsets[idx]
+        offsets_raw = offsets_raw[idx]
+        levels = levels[idx]
+
+        # assemble predicted segments
+        pt_ctr = points[:, 0]
+        left = pt_ctr - offsets[:, 0] * points[:, 3]
+        right = pt_ctr + offsets[:, 1] * points[:, 3]
+        segs = torch.stack((left, right), dim=-1)
+
+        # filter segments by length threshold
+        seg_lens = right - left
+        idx = seg_lens > self.seg_len_thresh
+        segs, scores = segs[idx], scores[idx]
+        levels = levels[idx]
+        offsets_raw = offsets_raw[idx]
+
+        return segs, scores, levels, offsets_raw
+
+    def log(self, is_last=False):
+        metrics = self.counts / self.text_cnt
+        log_str = "\nFinal:" if is_last else f"\n[{self.itr}/{self.num_itrs}]"
+        for i, rank in enumerate(self.ranks):
+            log_str += "\n-----"
+            for j, thresh in enumerate(self.iou_threshs):
+                log_str += (
+                    f"\nRank@{rank}, IoU@{thresh:.1f}: "
+                    f"{(metrics[i, j] * 100):.2f}"
+                )
+        self.logger.write(log_str)
 
 class Evaluator:
 
@@ -3200,7 +4417,7 @@ class Evaluator:
 
             fpn_logits_list, fpn_offsets_list = tuple(), tuple()
             for text, text_mask in zip(text_list, text_mask_list):
-                fpn_logits, fpn_offsets, _ = \
+                fpn_logits, fpn_offsets, _, _ = \
                     self.model.fuse_and_predict(fpn, fpn_masks, text, text_mask)
                 fpn_logits_list += (fpn_logits, )
                 fpn_offsets_list += (fpn_offsets, )
@@ -3443,6 +4660,653 @@ class Evaluator:
                 )
         self.logger.write(log_str)
 
+
+class EvaluatorNoNMS: 
+    def __init__(self, opt):
+ 
+        self.opt = opt
+ 
+        # set random seed
+        rng = fix_random_seed(opt.get('seed', 2022))
+ 
+        # prepare dataset
+        dataset = make_dataset(opt['eval']['data'], is_training=False)
+        self.dataloader, _ = make_dataloader(
+            dataset, is_training=False, generator=rng, batch_size=1, num_workers=0
+        )
+        self.num_itrs = len(self.dataloader)
+        self.itr = self.text_cnt = 0
+ 
+        # load model
+        self.model = PtTransformer(opt['model']).cuda()
+        self.load_model()
+        self.model.eval().requires_grad_(False)
+        self.pt_gen = PtGenerator(**opt['pt_gen']).cuda()
+ 
+        # build logging utilities
+        self.log_interval = self.num_itrs // 10
+        self.logger = Logger(os.path.join(opt['_root'], f"eval_{opt['_ckpt']}.txt"))
+ 
+        # register model hyperparameters
+        self.max_vid_len = opt['model']['max_vid_len']
+        self.vid_stride = opt['model'].get('vid_stride', 1)
+        self.input_vid_len = self.max_vid_len * self.vid_stride
+ 
+        num_fpn_levels = opt['model']['num_fpn_levels']
+        mha_win_size = opt['model']['mha_win_size']
+        ds_strides = [2 ** i for i in range(num_fpn_levels)]
+        min_chunk_size = 1
+        for idx in range(num_fpn_levels):
+            stride = ds_strides[idx]
+            if mha_win_size > 0:
+                stride *= (mha_win_size // 2) * 2
+            min_chunk_size = max(min_chunk_size, stride)
+        assert self.max_vid_len % min_chunk_size == 0, (
+            f"max video length must be a multiple of {min_chunk_size}"
+        )
+        self.min_chunk_size = min_chunk_size
+ 
+        # register evaluation hyperparameters
+        self.ranks = opt['eval'].get('ranks', (1, 5))
+        self.topk = max(self.ranks)
+        self.iou_threshs = np.array(opt['eval'].get('iou_threshs', (0.3, 0.5)))
+        self.counts = np.zeros((len(self.ranks), len(self.iou_threshs)))
+ 
+        self.window_size = opt['eval'].get('window_size')
+        self.window_stride = opt['eval'].get('window_stride')
+ 
+        self.batched_nms = lambda segs, scores: batched_nms(
+            segs, scores, **opt['eval']['nms']
+        )
+        self.pre_nms_topk = opt['eval']['pre_nms_topk']
+        self.pre_nms_thresh = opt['eval']['pre_nms_thresh']
+        self.seg_len_thresh = opt['eval']['seg_len_thresh']
+ 
+    def load_model(self):
+        filename = os.path.join(
+            self.opt['_root'], 'models', f"{self.opt['_ckpt']}.pth"
+        )
+        ckpt = torch.load(filename, map_location='cpu')
+        self.model.load_state_dict(ckpt['model_ema'])
+        print0(f"Loaded checkpoint [epoch {self.opt['_ckpt']}]...")
+ 
+    @torch.no_grad()
+    def run(self):
+        import numpy as np
+        import csv
+        import json
+ 
+        print0("Evaluation started.")
+        start_time = time.time()
+ 
+        # ---- compute FLOPs per forward pass (once) ----
+        flops_per_forward = None
+        try:
+            from fvcore.nn import FlopCountAnalysis
+            first_data = next(iter(self.dataloader))[0]
+            dummy_C = first_data['vid'].size(0)
+            dummy_vid = torch.randn(1, dummy_C, self.input_vid_len).cuda()
+            dummy_vid_mask = torch.ones(
+                1, 1, self.input_vid_len, dtype=torch.bool
+            ).cuda()
+ 
+            encoder_flops = FlopCountAnalysis(
+                self.model.encode_video, (dummy_vid, dummy_vid_mask)
+            )
+            encoder_flops.unsupported_ops_warnings(False)
+            encoder_flops.uncalled_modules_warnings(False)
+            enc_total = encoder_flops.total()
+ 
+            with torch.no_grad():
+                fpn, fpn_masks = self.model.encode_video(dummy_vid, dummy_vid_mask)
+                dummy_text = first_data['text']
+                if not isinstance(dummy_text, tuple):
+                    dummy_text = (dummy_text,)
+                dummy_text = dummy_text[0][None].cuda()
+                dummy_text_mask = dummy_text.new_full(
+                    (1, 1, dummy_text.size(-1)), 1, dtype=torch.bool
+                ).cuda()
+                dummy_text_enc, dummy_text_mask_enc = \
+                    self.model.encode_text(dummy_text, dummy_text_mask)
+ 
+            fusion_flops = FlopCountAnalysis(
+                self.model.fuse_and_predict,
+                (fpn, fpn_masks, dummy_text_enc, dummy_text_mask_enc)
+            )
+            fusion_flops.unsupported_ops_warnings(False)
+            fusion_flops.uncalled_modules_warnings(False)
+            fuse_total = fusion_flops.total()
+ 
+            flops_per_forward = enc_total + fuse_total
+            print0(f"FLOPs per forward pass: "
+                   f"encoder={enc_total/1e9:.2f}G + "
+                   f"fusion={fuse_total/1e9:.2f}G = "
+                   f"total={flops_per_forward/1e9:.2f}G")
+        except ImportError:
+            print0("fvcore not installed — skipping FLOP count. "
+                   "Install with: pip install fvcore")
+        except Exception as e:
+            print0(f"FLOP counting failed ({e}), continuing without it.")
+        
+        print("No NMS")
+ 
+        self.flops_per_forward = flops_per_forward
+ 
+        # ---- per-sample CSV rows + no-NMS diagnostic ----
+        sample_rows = []
+        no_nms_results = []
+        global_sample_idx = 0
+ 
+        for data_list in self.dataloader:
+            results = self.predict(data_list[0])
+            targets = data_list[0]['segment']
+ 
+            # extract metadata
+            video_duration = data_list[0].get('duration', None)
+            video_id = data_list[0].get('video_id',
+                       data_list[0].get('vid_id',
+                       data_list[0].get('id', None)))
+            raw_query = data_list[0].get('query',
+                        data_list[0].get('query_text',
+                        data_list[0].get('text_raw', None)))
+            clip_stride = data_list[0].get('clip_stride', None)
+            clip_size = data_list[0].get('clip_size', None)
+            fps = data_list[0].get('fps', None)
+            vid_len = data_list[0]['vid'].size(-1)
+ 
+            assert len(results) == len(targets)
+ 
+            for q_idx, (result, target) in enumerate(zip(results, targets)):
+                segs = result['segments']
+                scores = result['scores']
+                levels = result['levels']
+                offsets_raw = result['offsets']
+ 
+                idx = scores.argsort(descending=True)
+                segs = segs[idx[:self.topk]]
+                scores = scores[idx[:self.topk]]
+                levels = levels[idx[:self.topk]]
+                offsets_raw = offsets_raw[idx[:self.topk]]
+ 
+                target_t = torch.as_tensor(target, dtype=torch.float)
+                target_expanded = target_t.expand(len(segs), -1)
+ 
+                iou_topk = iou(segs, target_expanded)
+                iou_n = np.array([iou_topk[:i].max().item() for i in self.ranks])
+                self.counts += (iou_n[:, None] >= self.iou_threshs[None])
+ 
+                # ---- build per-sample CSV row ----
+                gt_start_val = float(target[0])
+                gt_end_val = float(target[1])
+                gt_dur = gt_end_val - gt_start_val
+ 
+                r1_iou = iou_topk[:1].max().item() if len(iou_topk) > 0 else 0.0
+                r5_iou = iou_topk[:5].max().item() if len(iou_topk) > 0 else 0.0
+ 
+                n_proposals = len(segs)
+ 
+                score_gap_r1_r2 = None
+                if len(scores) >= 2:
+                    score_gap_r1_r2 = (scores[0] - scores[1]).item()
+ 
+                query_str = None
+                if raw_query is not None:
+                    if isinstance(raw_query, (list, tuple)):
+                        query_str = str(raw_query[q_idx]) if q_idx < len(raw_query) else str(raw_query)
+                    elif isinstance(raw_query, str):
+                        query_str = raw_query
+ 
+                row = {
+                    'sample_idx': global_sample_idx,
+                    'video_id': video_id,
+                    'query': query_str,
+                    'gt_start': gt_start_val,
+                    'gt_end': gt_end_val,
+                    'gt_duration': gt_dur,
+                    'video_duration': video_duration,
+                    'gt_moment_fraction': gt_dur / video_duration if video_duration else None,
+                    'vid_feat_len': vid_len,
+                    'fps': fps,
+                    'clip_stride': clip_stride,
+                    'clip_size': clip_size,
+                    'r1_iou': r1_iou,
+                    'r5_iou': r5_iou,
+                    'r5_minus_r1_iou': r5_iou - r1_iou,
+                    'n_proposals_after_nms': n_proposals,
+                    'score_gap_r1_r2': score_gap_r1_r2,
+                    'n_windows': self._n_windows,
+                    'query_token_len': self._query_token_lens[q_idx] if q_idx < len(self._query_token_lens) else None,
+                    'flops_per_forward': self.flops_per_forward,
+                    'total_flops': (self._n_windows * self.flops_per_forward) if self.flops_per_forward else None,
+                }
+ 
+                # top-5 proposal details
+                k = min(5, len(segs))
+                for i in range(5):
+                    if i < k:
+                        row[f'top{i+1}_level'] = levels[i].item()
+                        row[f'top{i+1}_score'] = scores[i].item()
+                        row[f'top{i+1}_iou'] = iou_topk[i].item()
+                        row[f'top{i+1}_seg_start'] = segs[i, 0].item()
+                        row[f'top{i+1}_seg_end'] = segs[i, 1].item()
+                        row[f'top{i+1}_offset_left'] = offsets_raw[i, 0].item()
+                        row[f'top{i+1}_offset_right'] = offsets_raw[i, 1].item()
+                    else:
+                        row[f'top{i+1}_level'] = None
+                        row[f'top{i+1}_score'] = None
+                        row[f'top{i+1}_iou'] = None
+                        row[f'top{i+1}_seg_start'] = None
+                        row[f'top{i+1}_seg_end'] = None
+                        row[f'top{i+1}_offset_left'] = None
+                        row[f'top{i+1}_offset_right'] = None
+ 
+                # ---- No-NMS diagnostic: top-1/top-5 by cls_score ----
+                pre_nms = self._pre_nms_proposals[q_idx]
+                pre_segs_grid = pre_nms['segs_grid']
+                pre_scores = pre_nms['scores']
+                pre_levels = pre_nms['levels']
+ 
+                if len(pre_scores) == 0:
+                    no_nms_row = {
+                        'sample_idx': global_sample_idx,
+                        'gt_sec': [gt_start_val, gt_end_val],
+                        'gt_duration': gt_dur,
+                        'duration': float(video_duration) if video_duration else None,
+                        'top1_iou': 0.0, 'top1_score': 0.0, 'top1_level': -1,
+                        'top1_seg_sec': [0.0, 0.0],
+                        'top5_best_iou': 0.0, 'top5_ious': [], 'top5_levels': [],
+                        'num_proposals': 0,
+                    }
+                else:
+                    # Convert grid → seconds
+                    nn_segs_sec = pre_segs_grid.clone().float() * self.vid_stride
+                    nn_segs_sec = (nn_segs_sec * clip_stride + 0.5 * clip_size) / fps
+                    duration_val = float(video_duration) if video_duration else 1e8
+                    nn_segs_sec = torch.clamp(nn_segs_sec, min=0, max=duration_val)
+ 
+                    # IoU with GT
+                    nn_inter_s = torch.clamp(nn_segs_sec[:, 0], min=gt_start_val)
+                    nn_inter_e = torch.clamp(nn_segs_sec[:, 1], max=gt_end_val)
+                    nn_inter = torch.clamp(nn_inter_e - nn_inter_s, min=0)
+                    nn_union = (nn_segs_sec[:, 1] - nn_segs_sec[:, 0]) + gt_dur - nn_inter
+                    nn_ious = nn_inter / (nn_union + 1e-8)
+ 
+                    # Already sorted by score descending
+                    nn_top1_iou = nn_ious[0].item()
+                    nn_top1_score = pre_scores[0].item()
+                    nn_top1_level = pre_levels[0].item()
+                    nn_top1_seg = nn_segs_sec[0].tolist()
+ 
+                    nn_k = min(5, len(nn_ious))
+                    nn_top5_ious = nn_ious[:nn_k].tolist()
+                    nn_top5_levels = pre_levels[:nn_k].tolist()
+                    nn_top5_best_iou = max(nn_top5_ious)
+ 
+                    no_nms_row = {
+                        'sample_idx': global_sample_idx,
+                        'gt_sec': [gt_start_val, gt_end_val],
+                        'gt_duration': gt_dur,
+                        'duration': float(video_duration) if video_duration else None,
+                        'top1_iou': nn_top1_iou,
+                        'top1_score': nn_top1_score,
+                        'top1_level': nn_top1_level,
+                        'top1_seg_sec': nn_top1_seg,
+                        'top5_best_iou': nn_top5_best_iou,
+                        'top5_ious': nn_top5_ious,
+                        'top5_levels': nn_top5_levels,
+                        'num_proposals': len(pre_scores),
+                    }
+ 
+                # Add no-NMS info to CSV row too
+                row['no_nms_top1_iou'] = no_nms_row['top1_iou']
+                row['no_nms_top1_score'] = no_nms_row['top1_score']
+                row['no_nms_top1_level'] = no_nms_row['top1_level']
+                row['no_nms_top5_best_iou'] = no_nms_row['top5_best_iou']
+                row['no_nms_num_proposals'] = no_nms_row['num_proposals']
+ 
+                sample_rows.append(row)
+                no_nms_results.append(no_nms_row)
+                global_sample_idx += 1
+ 
+            self.text_cnt += len(targets)
+            self.itr += 1
+ 
+            if self.itr == 1 or self.itr % self.log_interval == 0:
+                self.log()
+ 
+        # ---- save per-sample CSV ----
+        csv_path = os.path.join(
+            self.opt['_root'],
+            f"per_sample_eval_{self.opt['_ckpt']}.csv"
+        )
+        if sample_rows:
+            fieldnames = list(sample_rows[0].keys())
+            with open(csv_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(sample_rows)
+            print0(f"\nPer-sample CSV saved to: {csv_path}")
+            print0(f"  Total samples: {len(sample_rows)}")
+            print0(f"  Columns: {len(fieldnames)}")
+ 
+        # ---- No-NMS diagnostic summary ----
+        print("\n" + "=" * 80)
+        print("NO-NMS DIAGNOSTIC (top-1 / top-5 by cls_score, no NMS)")
+        print("=" * 80)
+ 
+        nn_top1_ious = np.array([r['top1_iou'] for r in no_nms_results])
+        nn_top5_ious = np.array([r['top5_best_iou'] for r in no_nms_results])
+ 
+        # Also collect with-NMS for side-by-side comparison
+        nms_r1_ious = np.array([r['r1_iou'] for r in sample_rows])
+        nms_r5_ious = np.array([r['r5_iou'] for r in sample_rows])
+ 
+        print(f"\n{'':>20s}  {'No-NMS':>12s}  {'With-NMS':>12s}  {'Diff':>8s}")
+        print(f"{'':>20s}  {'─'*12}  {'─'*12}  {'─'*8}")
+        for thresh in [0.3, 0.5, 0.7]:
+            nn_r1 = (nn_top1_ious >= thresh).mean() * 100
+            nn_r5 = (nn_top5_ious >= thresh).mean() * 100
+            nms_r1 = (nms_r1_ious >= thresh).mean() * 100
+            nms_r5 = (nms_r5_ious >= thresh).mean() * 100
+            print(f"  R1@IoU={thresh}:       {nn_r1:6.2f}%       {nms_r1:6.2f}%    {nms_r1 - nn_r1:+.2f}")
+            print(f"  R5@IoU={thresh}:       {nn_r5:6.2f}%       {nms_r5:6.2f}%    {nms_r5 - nn_r5:+.2f}")
+ 
+        # Top-1 level distribution (no-NMS)
+        print(f"\nNo-NMS top-1 level distribution:")
+        all_levels = [r['top1_level'] for r in no_nms_results]
+        max_level = max(all_levels) if all_levels else 0
+        for l in range(max_level + 1):
+            count = all_levels.count(l)
+            if count > 0:
+                avg_iou = np.mean([r['top1_iou'] for r in no_nms_results
+                                   if r['top1_level'] == l])
+                print(f"  Level {l}: {count}/{len(no_nms_results)} "
+                      f"({count/len(no_nms_results)*100:.1f}%)  "
+                      f"avg_iou={avg_iou:.4f}")
+ 
+        # Per-sample: no-NMS vs with-NMS comparison
+        improved_by_nms = 0
+        degraded_by_nms = 0
+        for row in sample_rows:
+            diff = row['r1_iou'] - row['no_nms_top1_iou']
+            if diff > 0.01:
+                improved_by_nms += 1
+            elif diff < -0.01:
+                degraded_by_nms += 1
+        print(f"\nNMS impact on top-1 IoU:")
+        print(f"  Improved by NMS:  {improved_by_nms}/{len(sample_rows)} "
+              f"({improved_by_nms/len(sample_rows)*100:.1f}%)")
+        print(f"  Degraded by NMS:  {degraded_by_nms}/{len(sample_rows)} "
+              f"({degraded_by_nms/len(sample_rows)*100:.1f}%)")
+        print(f"  Unchanged:        {len(sample_rows) - improved_by_nms - degraded_by_nms}/{len(sample_rows)}")
+ 
+        # Save no-NMS JSON
+        no_nms_path = os.path.join(
+            self.opt['_root'],
+            f"no_nms_diagnostic_{self.opt['_ckpt']}.json"
+        )
+        with open(no_nms_path, 'w') as f:
+            json.dump(no_nms_results, f, indent=2)
+        print(f"\nNo-NMS diagnostic saved to: {no_nms_path}")
+ 
+        print("=" * 80)
+        self.log(is_last=True)
+        print0(f"Evaluation completed in {time_str(time.time() - start_time)}.")
+ 
+    def predict(self, data):
+        """ Predict event segments given a single video and an arbitrary
+        number of text queries. This function assumes single-GPU evaluation.
+        """
+        # parse text
+        tokens = data['text']
+        if not isinstance(tokens, tuple):
+            tokens = (tokens, )
+ 
+        text_list, text_mask_list = tuple(), tuple()
+        for text in tokens:
+            text = text[None]
+            text_mask = text.new_full(
+                (1, 1, text.size(-1)), 1, dtype=torch.bool
+            )
+            text = text.cuda(non_blocking=True)
+            text_mask = text_mask.cuda(non_blocking=True)
+ 
+            text, text_mask = self.model.encode_text(text, text_mask)
+            text_list += (text, )
+            text_mask_list += (text_mask, )
+ 
+        # parse video
+        vid = data['vid']
+        vid_len = vid.size(-1)
+ 
+        # external scores (n, t)
+        ext_scores = data['ext_scores']
+        if ext_scores is not None and ext_scores.ndim == 1:
+            ext_scores = ext_scores[None]
+ 
+        # sliding-window evaluation
+        window_size = min(self.window_size or vid_len, vid_len)
+        window_stride = self.window_stride or window_size
+ 
+        n = vid_len - window_size
+        windows, window_offsets, window_ext_scores = tuple(), tuple(), tuple()
+ 
+        idx = 0
+        while idx <= n:
+            windows += (vid[..., idx:idx + window_size], )
+            window_offsets += (idx, )
+            if ext_scores is not None:
+                window_ext_scores += (ext_scores[..., idx:idx + window_size], )
+            else:
+                window_ext_scores += (None, )
+            idx += window_stride
+ 
+        if n > 0 and n % window_stride > 0:
+            windows += (vid[..., -window_size:], )
+            window_offsets += (n, )
+            if ext_scores is not None:
+                window_ext_scores += (ext_scores[..., -window_size:], )
+            else:
+                window_ext_scores += (None, )
+ 
+        input_vid_len = self.input_vid_len
+        if window_size > input_vid_len:
+            stride = self.min_chunk_size * self.vid_stride
+            input_vid_len = (window_size + (stride - 1)) // stride * stride
+ 
+        # track per-sample compute proxies
+        self._n_windows = len(windows)
+        self._query_token_lens = [t.size(-1) for t in text_list]
+ 
+        segs_list, scores_list = tuple(), tuple()
+        levels_list, offsets_raw_list = tuple(), tuple()
+ 
+        for window, window_offset, window_ext in \
+            zip(windows, window_offsets, window_ext_scores):
+            window = F.pad(window, (0, input_vid_len - window_size))[None]
+            window_mask = torch.arange(input_vid_len).view(1, 1, -1) < window_size
+            window = window.cuda(non_blocking=True)
+            window_mask = window_mask.cuda(non_blocking=True)
+            if window_ext is not None:
+                window_ext = F.pad(window_ext, (0, input_vid_len - window_size))
+                window_ext = window_ext.cuda(non_blocking=True)
+ 
+            fpn, fpn_masks = self.model.encode_video(window, window_mask)
+            fpn_n_points = [m.size(-1) for m in fpn_masks]
+            fpn_points = self.pt_gen(fpn_n_points)
+ 
+            fpn_logits_list, fpn_offsets_list = tuple(), tuple()
+            for text, text_mask in zip(text_list, text_mask_list):
+                fpn_logits, fpn_offsets, _, _ = \
+                    self.model.fuse_and_predict(fpn, fpn_masks, text, text_mask)
+                fpn_logits_list += (fpn_logits, )
+                fpn_offsets_list += (fpn_offsets, )
+            fpn_masks = [m.squeeze(1) for m in fpn_masks]
+ 
+            window_segs_list, window_scores_list = tuple(), tuple()
+            window_levels_list, window_offsets_raw_list = tuple(), tuple()
+ 
+            for idx, (fpn_logits, fpn_offsets) in \
+                enumerate(zip(fpn_logits_list, fpn_offsets_list)):
+ 
+                w_segs, w_scores, w_levels, w_offsets_raw = \
+                    self._collect_segments(
+                        fpn_points, fpn_logits, fpn_offsets, fpn_masks,
+                        window_ext[idx] if window_ext is not None else None
+                    )
+                w_segs += window_offset / self.vid_stride
+                window_segs_list += (w_segs.cpu(), )
+                window_scores_list += (w_scores.cpu(), )
+                window_levels_list += (w_levels.cpu(), )
+                window_offsets_raw_list += (w_offsets_raw.cpu(), )
+ 
+            segs_list += (window_segs_list, )
+            scores_list += (window_scores_list, )
+            levels_list += (window_levels_list, )
+            offsets_raw_list += (window_offsets_raw_list, )
+ 
+        segs_list = [torch.cat(x) for x in zip(*segs_list)]
+        scores_list = [torch.cat(x) for x in zip(*scores_list)]
+        levels_list = [torch.cat(x) for x in zip(*levels_list)]
+        offsets_raw_list = [torch.cat(x) for x in zip(*offsets_raw_list)]
+ 
+        # ---- Save pre-NMS proposals for no-NMS diagnostic ----
+        self._pre_nms_proposals = []
+ 
+        results = tuple()
+        for segs, scores, levels, offsets_raw in \
+            zip(segs_list, scores_list, levels_list, offsets_raw_list):
+            # top-k pre-NMS
+            n_topk = min(len(segs), self.pre_nms_topk)
+            idx = scores.argsort(descending=True)[:n_topk]
+            pre_nms_segs = segs[idx]
+            pre_nms_scores = scores[idx]
+            pre_nms_levels = levels[idx]
+            pre_nms_offsets = offsets_raw[idx]
+ 
+            # Store for no-NMS diagnostic (already sorted by score desc)
+            self._pre_nms_proposals.append({
+                'segs_grid': pre_nms_segs.clone(),
+                'scores': pre_nms_scores.clone(),
+                'levels': pre_nms_levels.clone(),
+            })
+ 
+            # NMS
+            post_nms_segs, post_nms_scores = self.batched_nms(
+                pre_nms_segs, pre_nms_scores
+            )
+ 
+            # recover level/offset info by matching post-NMS back to pre-NMS
+            if len(post_nms_segs) > 0 and len(pre_nms_segs) > 0:
+                diffs = (post_nms_segs.unsqueeze(1)
+                         - pre_nms_segs.unsqueeze(0)).abs().sum(-1)
+                matched_idx = diffs.argmin(dim=1)
+                post_nms_levels = pre_nms_levels[matched_idx]
+                post_nms_offsets = pre_nms_offsets[matched_idx]
+            else:
+                post_nms_levels = torch.zeros(0, dtype=torch.long)
+                post_nms_offsets = torch.zeros(0, 2)
+ 
+            # convert segments to timestamps
+            if len(post_nms_segs) > 0:
+                clip_stride = data['clip_stride']
+                clip_size = data['clip_size']
+                fps = data['fps']
+                duration = data['duration']
+ 
+                post_nms_segs *= self.vid_stride
+                post_nms_segs = (post_nms_segs * clip_stride
+                                 + 0.5 * clip_size) / fps
+                post_nms_segs = torch.clamp(post_nms_segs, min=0, max=duration)
+ 
+            results += ({
+                'segments': post_nms_segs,
+                'scores': post_nms_scores,
+                'levels': post_nms_levels,
+                'offsets': post_nms_offsets,
+            }, )
+ 
+        return results
+ 
+    def _collect_segments(
+        self,
+        fpn_points,     # List[(p, 4) * #levels]
+        fpn_logits,     # List[(1, p) * #levels]
+        fpn_offsets,    # List[(1, p, 2) * #levels]
+        fpn_masks,      # List[(1, p) * #levels]
+        ext_scores,     # (p, )
+    ):
+        points_list, scores_list, offsets_list = tuple(), tuple(), tuple()
+        levels_list, offsets_raw_list = tuple(), tuple()
+ 
+        # loop over all FPN levels
+        for level, (points, logits, offsets, masks) in enumerate(
+            zip(fpn_points, fpn_logits, fpn_offsets, fpn_masks)
+        ):
+            logits, offsets, masks = logits[0], offsets[0], masks[0]
+ 
+            # compute point scores
+            scores = torch.sigmoid(logits)
+            if ext_scores is not None:
+                scores *= ext_scores
+                ext_scores = F.max_pool1d(
+                    ext_scores[None, None], kernel_size=3, stride=2, padding=1
+                )[0, 0]
+            scores *= masks.float()
+ 
+            # filter by confidence threshold
+            idx = scores > self.pre_nms_thresh
+            points_list += (points[idx], )
+            scores_list += (scores[idx], )
+            offsets_list += (offsets[idx], )
+            offsets_raw_list += (offsets[idx].clone(), )
+            levels_list += (
+                torch.full((idx.sum(),), level,
+                           dtype=torch.long, device=points.device),
+            )
+ 
+        points = torch.cat(points_list)
+        scores = torch.cat(scores_list)
+        offsets = torch.cat(offsets_list)
+        offsets_raw = torch.cat(offsets_raw_list)
+        levels = torch.cat(levels_list)
+ 
+        # only keep top-k scoring boxes
+        n_topk = min(len(points), self.pre_nms_topk)
+        idx = scores.argsort(descending=True)[:n_topk]
+        points, scores, offsets = points[idx], scores[idx], offsets[idx]
+        offsets_raw = offsets_raw[idx]
+        levels = levels[idx]
+ 
+        # assemble predicted segments
+        pt_ctr = points[:, 0]
+        left = pt_ctr - offsets[:, 0] * points[:, 3]
+        right = pt_ctr + offsets[:, 1] * points[:, 3]
+        segs = torch.stack((left, right), dim=-1)
+ 
+        # filter segments by length threshold
+        seg_lens = right - left
+        idx = seg_lens > self.seg_len_thresh
+        segs, scores = segs[idx], scores[idx]
+        levels = levels[idx]
+        offsets_raw = offsets_raw[idx]
+ 
+        return segs, scores, levels, offsets_raw
+ 
+    def log(self, is_last=False):
+        metrics = self.counts / self.text_cnt
+        log_str = "\nFinal:" if is_last else f"\n[{self.itr}/{self.num_itrs}]"
+        for i, rank in enumerate(self.ranks):
+            log_str += "\n-----"
+            for j, thresh in enumerate(self.iou_threshs):
+                log_str += (
+                    f"\nRank@{rank}, IoU@{thresh:.1f}: "
+                    f"{(metrics[i, j] * 100):.2f}"
+                )
+        self.logger.write(log_str)
+
+
+
 class EvaluatorAnalysis:
 
     def __init__(self, opt):
@@ -3654,7 +5518,7 @@ class EvaluatorAnalysis:
                 # *** Clear attention weights before each fusion call ***
                 self.model.fusion._last_attn_weights = []
                 
-                fpn_logits, fpn_offsets, _ = \
+                fpn_logits, fpn_offsets, _, _ = \
                     self.model.fuse_and_predict(fpn, fpn_masks, text, text_mask)
                 fpn_logits_list += (fpn_logits,)
                 fpn_offsets_list += (fpn_offsets,)
@@ -4045,7 +5909,7 @@ class EvaluatorAnalysis:
 
             fpn_logits_list, fpn_offsets_list = tuple(), tuple()
             for text, text_mask in zip(text_list, text_mask_list):
-                fpn_logits, fpn_offsets, _ = \
+                fpn_logits, fpn_offsets, _, _ = \
                     self.model.fuse_and_predict(fpn, fpn_masks, text, text_mask)
                 fpn_logits_list += (fpn_logits, )
                 fpn_offsets_list += (fpn_offsets, )
@@ -4142,7 +6006,7 @@ class EvaluatorAnalysis:
             ):
                 # Clear and run fusion
                 self.model.fusion._last_attn_weights = []
-                fpn_logits, fpn_offsets, _ = \
+                fpn_logits, fpn_offsets, _, _ = \
                     self.model.fuse_and_predict(fpn, fpn_masks, text, text_mask)
                 
                 attn_list = self.model.fusion._last_attn_weights
