@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch
 from .blocks import LayerNorm, TransformerDecoder, LoopedTransformerDecoder, MaskedConv1D, MINDFusionBlock
 from .halt_methods import build_halting
+import torch.nn.functional as F
 
 modules = dict()
 def register_fusion(name):
@@ -100,9 +101,271 @@ class XAttNFusion(nn.Module):
 
         return out, out_masks, all_features
 
+@register_fusion('xattn_sd_halt')
+class XAttNFusionHalt(nn.Module):
+    """Fuse video and text features using attention with optional per-sample halting."""
+
+    def __init__(
+        self,
+        vid_dim,
+        text_dim,
+        n_layers=2,
+        n_heads=4,
+        attn_pdrop=0.0,
+        proj_pdrop=0.0,
+        path_pdrop=0.0,
+        xattn_mode='adaln',
+        return_features=True,
+        use_halting=False,
+        halt_bias_init=1.0,
+        num_branches=6,        # [ADDED] number of pyramid branches
+    ):
+        super(XAttNFusionHalt, self).__init__()
+
+        self.n_layers = n_layers
+        self.use_halting = use_halting
+        self.return_features = return_features
+
+        self.layers = nn.ModuleList()
+        for _ in range(n_layers):
+            self.layers.append(
+                TransformerDecoder(
+                    vid_dim, text_dim,
+                    n_heads=n_heads,
+                    attn_pdrop=attn_pdrop,
+                    proj_pdrop=proj_pdrop,
+                    path_pdrop=path_pdrop,
+                    xattn_mode=xattn_mode,
+                )
+            )
+
+        self.ln_out = LayerNorm(vid_dim)
+
+        if use_halting:
+            # [MODIFIED] project each branch independently to a fixed dim,
+            # then aggregate
+            self.halt_branch_proj = nn.Linear(vid_dim, 64)
+            self.halt_head = nn.Sequential(
+                nn.ReLU(),
+                nn.Linear(64 + 1, 32),   # 64 (avg of projected branches) + 1 (cos_sim)
+                nn.ReLU(),
+                nn.Linear(32, 1),
+            )
+
+        self.apply(self.__init_weights__)
+
+        if use_halting:
+            self.halt_head[-1].bias.data.fill_(halt_bias_init)
+
+        self._last_attn_weights = []
+
+    def __init_weights__(self, module):
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    # ------------------------------------------------------------------ #
+    #  Halting helpers                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _pool_branches(self, branch_features, branch_masks=None):
+        pooled = []
+        for i, x in enumerate(branch_features):
+            if branch_masks is not None:
+                mask = branch_masks[i].float()  # (B, 1, T) or (B, T)
+                if mask.dim() == 3:
+                    mask = mask.squeeze(1)      # (B, T)
+                x_masked = (x * mask.unsqueeze(1)).sum(dim=-1)  # (B, D)
+                x_masked = x_masked / mask.sum(dim=-1, keepdim=True).clamp(min=1)
+                pooled.append(x_masked)
+            else:
+                pooled.append(x.mean(dim=-1))
+        return torch.stack(pooled, dim=0).mean(dim=0)
+
+    def _compute_lambda(self, current, prev, current_masks=None, prev_masks=None):
+        """Compute conditional halt probability λ_k."""
+        h_k_raw = self._pool_branches(current, current_masks)    # (B, D=256)
+        h_prev_raw = self._pool_branches(prev, prev_masks)       # (B, D=256)
+
+        # Cosine similarity on raw features
+        cos_sim = F.cosine_similarity(
+            h_k_raw, h_prev_raw, dim=-1
+        ).unsqueeze(-1)                                           # (B, 1)
+
+        # Project to 64-dim for halt head
+        h_k = self.halt_branch_proj(h_k_raw)                     # (B, 64)
+
+        combined = torch.cat([h_k, cos_sim], dim=-1)             # (B, 65)
+        lambda_k = torch.sigmoid(self.halt_head(combined)).squeeze(-1)
+        return lambda_k
+
+    def _lambdas_to_probs(self, lambdas):
+        """Convert conditional λ_k to unconditional halt probabilities p_k.
+
+        Forces λ_K = 1 at the last step so probabilities sum to 1.
+        """
+        K = len(lambdas)
+        # Force halt at last step
+        lambdas[-1] = torch.ones_like(lambdas[-1])
+
+        p = []
+        for k in range(K):
+            if k == 0:
+                p_k = lambdas[0]
+            else:
+                # p_k = λ_k * Π_{j<k} (1 - λ_j)
+                survive = torch.stack(
+                    [1.0 - lambdas[j] for j in range(k)], dim=0
+                )
+                p_k = lambdas[k] * survive.prod(dim=0)
+            p.append(p_k)
+
+        return p  # list of K tensors, each (B,)
+
+    def _finalize_branches(self, branches, masks, text_size):
+        """Apply ln_out and handle kv_size repeat for each branch."""
+        out = tuple()
+        out_masks = tuple()
+        for q, m in zip(branches, masks):
+            q = self.ln_out(q)
+            if text_size is not None and q.size(0) != text_size:
+                q = q.repeat_interleave(text_size, dim=0)
+                m = m.repeat_interleave(text_size, dim=0)
+            out += (q,)
+            out_masks += (m,)
+        return out, out_masks
+
+    # ------------------------------------------------------------------ #
+    #  Original non-halting forward (single branch)                       #
+    # ------------------------------------------------------------------ #
+
+    def _forward(self, q, q_mask, kv, kv_mask, kv_size=None):
+        features = {} if self.return_features else None
+        for idx, layer in enumerate(self.layers):
+            q, q_mask = layer(q, q_mask, kv, kv_mask, kv_size)
+            if self.return_features:
+                features[f"fusion_layer_{idx+1}_q"] = q
+                features[f"fusion_layer_{idx+1}_q_mask"] = q_mask
+            self._last_attn_weights.append(layer._last_attn_weights)
+        q = self.ln_out(q)
+
+        if self.return_features:
+            features["fusion_ln_out_q"] = q
+            features["fusion_ln_out_q_mask"] = q_mask
+
+        if kv_size is not None and q.size(0) != kv.size(0):
+            q = q.repeat_interleave(kv_size, dim=0)
+            q_mask = q_mask.repeat_interleave(kv_size, dim=0)
+            if self.return_features:
+                features["fusion_repeated_q"] = q
+                features["fusion_repeated_q_mask"] = q_mask
+
+        return q, q_mask, features
+
+    # ------------------------------------------------------------------ #
+    #  Halting forward (all branches, depth-first iteration)              #
+    # ------------------------------------------------------------------ #
+
+    def _forward_halting(self, vid_tuple, vid_masks_tuple, text, text_mask, text_size=None):
+        n_branches = len(vid_tuple)
+        K = self.n_layers
+
+        # Expand vid features to match text batch BEFORE the loop
+        # so that prev and current always have the same batch dimension
+        current = list(vid_tuple)
+        current_masks = list(vid_masks_tuple)
+
+        if text_size is not None:
+            for b_idx in range(n_branches):
+                if current[b_idx].size(0) != text.size(0):
+                    current[b_idx] = current[b_idx].repeat_interleave(
+                        text_size, dim=0
+                    )
+                    current_masks[b_idx] = current_masks[b_idx].repeat_interleave(
+                        text_size, dim=0
+                    )
+
+        all_depth_outputs = []
+        lambdas = []
+
+        for k in range(K):
+            prev = list(current)
+
+            for b_idx in range(n_branches):
+                # kv_size=None since vid is already expanded to match text batch
+                current[b_idx], current_masks[b_idx] = self.layers[k](
+                    current[b_idx], current_masks[b_idx],
+                    text, text_mask, None
+                )
+                self._last_attn_weights.append(self.layers[k]._last_attn_weights)
+
+            lambda_k = self._compute_lambda(current, prev)
+            lambdas.append(lambda_k)
+
+            # text_size=None in finalize since already expanded
+            depth_out, depth_masks = self._finalize_branches(
+                current, current_masks, None
+            )
+            all_depth_outputs.append((depth_out, depth_masks))
+
+        halt_probs = self._lambdas_to_probs(lambdas)
+
+        return all_depth_outputs, halt_probs
+
+    # ------------------------------------------------------------------ #
+    #  Main forward dispatch                                              #
+    # ------------------------------------------------------------------ #
+
+    def forward(self, vid, vid_masks, text, text_mask, text_size=None):
+        """
+        When use_halting=False:
+            Returns: (out, out_masks, features)  — original behavior
+
+        When use_halting=True:
+            Returns: (all_depth_outputs, halt_probs)
+            - all_depth_outputs: list of K tuples (out_tuple, out_masks_tuple)
+            - halt_probs: list of K tensors of shape (B,)
+        """
+        if not self.use_halting:
+            # ---------- Original behavior ----------
+            if not isinstance(vid, tuple):
+                return self._forward(vid, vid_masks, text, text_mask, text_size)
+
+            all_features = {} if self.return_features else None
+            out, out_masks = tuple(), tuple()
+            for idx, (x, mask) in enumerate(zip(vid, vid_masks)):
+                x, mask, features = self._forward(x, mask, text, text_mask, text_size)
+                out += (x,)
+                out_masks += (mask,)
+                if self.return_features:
+                    all_features[f"fusion_pyramid_{idx+1}"] = features
+
+            return out, out_masks, all_features
+
+        # ---------- Halting behavior ----------
+        if not isinstance(vid, tuple):
+            # Wrap single branch as tuple for uniform handling
+            vid = (vid,)
+            vid_masks = (vid_masks,)
+            single_branch = True
+        else:
+            single_branch = False
+
+        all_depth_outputs, halt_probs = self._forward_halting(
+            vid, vid_masks, text, text_mask, text_size
+        )
+
+        # Unwrap if single branch input
+        if single_branch:
+            all_depth_outputs = [
+                (depth_out[0], depth_masks[0])
+                for depth_out, depth_masks in all_depth_outputs
+            ]
+
+        return all_depth_outputs, halt_probs
 
 @register_fusion('xattn_level')
-class XAttNFusion(nn.Module):
+class XAttNFusionLevel(nn.Module):
     def __init__(
         self,
         vid_dim,
@@ -116,7 +379,7 @@ class XAttNFusion(nn.Module):
         return_features=True,
         branch_depths=None,  # e.g. [2, 2, 3, 3, 4, 4]
     ):
-        super(XAttNFusion, self).__init__()
+        super(XAttNFusionLevel, self).__init__()
 
         self.branch_depths = branch_depths
         self.n_layers = n_layers
